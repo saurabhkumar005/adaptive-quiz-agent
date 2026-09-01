@@ -42,7 +42,7 @@ from core.agent import GroqAgent  # noqa: E402
 
 BANNER = r"""
 ╔═══════════════════════════════════════════════════════════════╗
-║          🃏  Flashcard Quiz Agent  —  CSE476 CA1             ║
+║               🃏  Flashcard Quiz Agent                       ║
 ║                                                               ║
 ║  Commands you can try:                                        ║
 ║    • "Add a card: Q: <question> / A: <answer>"               ║

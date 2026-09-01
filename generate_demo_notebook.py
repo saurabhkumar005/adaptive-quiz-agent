@@ -55,9 +55,8 @@ def stdout_output(text: str) -> dict:
 CELLS = [
     # ── Header ──────────────────────────────────────────────────────────────
     md(
-        "# 🃏 Flashcard Quiz Agent — Demo Notebook\n"
-        "### CSE476 Agentic AI · CA1 Project 1 · Topic T26\n\n"
-        "This notebook demonstrates the three required goals:\n\n"
+        "# 🃏 Flashcard Quiz Agent — Demo Notebook\n\n"
+        "This notebook demonstrates the agent across three goals:\n\n"
         "| Goal | Description |\n"
         "|------|-------------|\n"
         "| **Goal 1** | Add multiple flashcards via natural language (multi-step `add_card` calls) |\n"

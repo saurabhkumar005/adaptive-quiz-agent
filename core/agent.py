@@ -165,8 +165,26 @@ class GroqAgent:
                 return final_text
 
             # ── Intermediate state: one or more tool calls requested ──
-            # Persist the assistant "pause" message (with tool_calls) into history.
-            self._history.append(assistant_msg.model_dump())
+            # Build a clean assistant message dict. We deliberately avoid
+            # model_dump() because the Groq SDK injects extra fields such as
+            # 'annotations' that the Groq API itself rejects with a 400 error
+            # when they appear in the message history.
+            clean_tool_calls = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in tool_calls
+            ]
+            self._history.append({
+                "role": "assistant",
+                "content": assistant_msg.content or "",
+                "tool_calls": clean_tool_calls,
+            })
 
             for tc in tool_calls:
                 tool_name = tc.function.name

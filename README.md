@@ -1,12 +1,6 @@
-# 🃏 Flashcard Quiz Agent — CSE476 CA1 Project 1
+# 🃏 Flashcard Quiz Agent
 
-**Topic T26 · Study Domain · Solo Submission**
-
----
-
-## What it does
-
-An autonomous, adaptive flashcard agent that quizzes students and prioritises their weak spots. It executes a multi-step plan-act loop using the Groq inference API (`openai/gpt-oss-120b`), making real tool calls to manage its own flashcard database rather than generating static text responses.
+An autonomous, adaptive flashcard study tool powered by the [Groq](https://groq.com) inference API. The agent quizzes you interactively, remembers which cards you struggle with, and **automatically prioritises your weak spots** — not just random questions.
 
 ---
 
@@ -33,8 +27,8 @@ cd flashcard_agent
 
 # 2. Create and activate a virtual environment
 python -m venv venv
-# Windows Git Bash:
-source venv/Scripts/activate
+source venv/Scripts/activate      # Git Bash on Windows
+# .\venv\Scripts\Activate.ps1    # PowerShell
 
 # 3. Install dependencies
 pip install -r requirements.txt
@@ -65,26 +59,15 @@ flashcard_agent/
 ├── core/
 │   ├── __init__.py
 │   └── agent.py          # GroqAgent: ReAct loop + sliding-window memory
-└── demo.ipynb            # Executed notebook demonstrating 3 goals
+└── demo.ipynb            # Notebook demonstrating the agent across 3 goals
 ```
-
----
-
-## Rubric Compliance Checklist
-
-| Criterion | Evidence |
-|---|---|
-| ≥ 2 working tools | `add_card` + `quiz_me` (+ `record_answer`) |
-| Multi-step plan-act loop | `GroqAgent._run_loop()` in `core/agent.py` |
-| Memory across turns | Sliding window + `incorrect_count` persisted to `flashcard_db.json` |
-| Adaptive (not random) selection | `quiz_me()` sorts by `incorrect_count` descending |
-| Honest failure documented | Token-bleed issue → 120B model + strict prompt guardrails |
-| Running notebook | `demo.ipynb` with 3 goals and multi-step tool traces |
 
 ---
 
 ## Architecture Notes
 
-- **Dispatch Map pattern**: `TOOL_REGISTRY` is a plain `dict[str, callable]`. The agent loop does `TOOL_REGISTRY[tool_name](**kwargs)` — O(1) lookup, zero `if/elif` chains.
+- **ReAct loop**: The agent runs a continuous plan-act loop — it calls tools, reads results, reasons over them, and loops until it has a final answer. It never just generates text directly.
+- **Dispatch Map pattern**: `TOOL_REGISTRY` is a plain `dict[str, callable]`. The loop executes `TOOL_REGISTRY[tool_name](**kwargs)` — O(1) lookup, zero `if/elif` chains.
+- **Adaptive selection**: `quiz_me()` sorts all cards by `incorrect_count` descending. The weakest card is always served first.
 - **Security**: All credentials loaded via `python-dotenv`. No hardcoded keys anywhere in the codebase.
-- **Atomic writes**: `flashcard_db.json` is written to a `.tmp` file first, then renamed, preventing corruption on crash.
+- **Atomic writes**: `flashcard_db.json` is written to a `.tmp` file first, then renamed, preventing data corruption on crash.
