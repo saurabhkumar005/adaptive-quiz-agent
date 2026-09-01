@@ -138,6 +138,7 @@ def quiz_me() -> str:
         "card": {
             "id": chosen["id"],
             "question": chosen["question"],
+            "answer": chosen["answer"],
             "incorrect_count": chosen["incorrect_count"],
             "total_attempts": chosen["total_attempts"],
         },
