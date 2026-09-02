@@ -1,18 +1,27 @@
 """
 tools/flashcards.py
 ====================
-Persistent flashcard state store and the four agent tools:
-  - add_card(question, answer)               -> adds a new card
-  - quiz_me(mode, topic)                     -> returns the highest-priority card
-                                               using the smart adaptive urgency score
+Persistent flashcard state store and the five agent tools:
+  - add_card(question, answer)               -> adds a single new card
+  - add_cards_batch(cards)                   -> inserts a list of cards in one operation
+  - quiz_me(mode, topic, count)              -> returns top-N highest-priority cards
   - record_answer(card_id, is_correct)       -> updates card metrics with decay
   - get_stats()                              -> returns a full database summary
 
 State is persisted to ``flashcard_db.json`` in the project root so that
 weak-spot data survives across agent sessions.
 
-Bug fixes included in this revision
--------------------------------------
+Additions in this revision
+--------------------------
+* ``add_cards_batch``: Accepts a list of {question, answer} dicts and inserts
+  all cards in a single tool call. Resolves Generation Derailment caused by
+  firing 20+ individual add_card calls in one turn (token-budget exhaustion).
+* ``quiz_me`` count parameter: Accepts count=N to return the top-N priority
+  cards in one call. Resolves Parallel Read Duplication where the agent fired
+  quiz_me 3x in one turn and received the same card 3 times.
+
+Previous bug fixes
+------------------
 * Card Starvation / Priority Lockout: ``incorrect_count`` now decays on
   correct answers via ``consecutive_correct`` tracking. Unattempted cards
   receive a base urgency of 5.0, so they are always explored before stale
@@ -150,9 +159,84 @@ def add_card(question: str, answer: str) -> str:
     })
 
 
-def quiz_me(mode: str = "adaptive", topic: str | None = None) -> str:
+def add_cards_batch(cards: list[dict]) -> str:
     """
-    Return the highest-priority flashcard using the smart adaptive algorithm.
+    Insert multiple flashcards in a single tool call.
+
+    This is the preferred method for bulk creation (4+ cards) because it
+    avoids per-turn token-budget exhaustion that causes mid-task abandonment
+    when the agent tries to fire 20+ sequential add_card calls.
+
+    Parameters
+    ----------
+    cards : list of dict
+        Each element must have ``"question"`` and ``"answer"`` string keys.
+        Invalid or empty entries are skipped and reported in the response.
+
+    Returns
+    -------
+    str
+        A JSON-encoded object with ``count``, ``cards`` (added), and
+        ``skipped`` (entries that failed validation).
+
+    Examples
+    --------
+    add_cards_batch(cards=[
+        {"question": "What is Docker?", "answer": "OS-level virtualization"},
+        {"question": "What is Kubernetes?", "answer": "Container orchestration platform"},
+    ])
+    """
+    if not isinstance(cards, list) or len(cards) == 0:
+        return json.dumps({
+            "status": "error",
+            "message": "cards must be a non-empty list of {question, answer} objects.",
+        })
+
+    added: list[dict] = []
+    skipped: list[dict] = []
+
+    for entry in cards:
+        question = str(entry.get("question", "")).strip()
+        answer = str(entry.get("answer", "")).strip()
+
+        if not question or not answer:
+            skipped.append({"entry": entry, "reason": "Missing or empty question/answer."})
+            continue
+
+        card_id = FLASHCARD_DB["next_id"]
+        FLASHCARD_DB["next_id"] += 1
+
+        new_card = {
+            "id": card_id,
+            "question": question,
+            "answer": answer,
+            "incorrect_count": 0,
+            "total_attempts": 0,
+            "consecutive_correct": 0,
+            "last_attempted": None,
+        }
+        FLASHCARD_DB["cards"][str(card_id)] = new_card
+        added.append({"id": card_id, "question": question, "answer": answer})
+
+    if added:
+        _save_db(FLASHCARD_DB)
+
+    return json.dumps({
+        "status": "success" if added else "error",
+        "count": len(added),
+        "skipped": len(skipped),
+        "message": (
+            f"{len(added)} flashcard(s) added successfully."
+            + (f" {len(skipped)} entry/entries skipped due to validation errors." if skipped else "")
+        ),
+        "cards": added,
+        "skipped_details": skipped,
+    })
+
+
+def quiz_me(mode: str = "adaptive", topic: str | None = None, count: int = 1) -> str:
+    """
+    Return the top-N highest-priority flashcards using the smart adaptive algorithm.
 
     Parameters
     ----------
@@ -166,11 +250,18 @@ def quiz_me(mode: str = "adaptive", topic: str | None = None) -> str:
     topic : str or None, optional
         If provided, only cards whose question or answer contains this
         substring (case-insensitive) are considered.
+    count : int, optional
+        Number of cards to return (default 1). Allows the agent to serve
+        multiple questions in one call instead of firing duplicate parallel
+        calls that return the same top card every time. Capped at the number
+        of available unique candidates.
 
     Returns
     -------
     str
-        A JSON-encoded object containing the selected card and priority metadata.
+        A JSON-encoded object with a ``cards`` list (length = count_returned)
+        plus shared priority metadata. When count=1 a legacy ``card`` key is
+        also present for backward compatibility with record_answer workflows.
     """
     all_cards = list(FLASHCARD_DB["cards"].values())
 
@@ -182,6 +273,12 @@ def quiz_me(mode: str = "adaptive", topic: str | None = None) -> str:
                 "Please add some cards first using add_card before quizzing."
             ),
         })
+
+    # ---- Input validation ---------------------------------------------------
+    try:
+        count = max(1, int(count))
+    except (TypeError, ValueError):
+        count = 1
 
     # ---- Topic filter -------------------------------------------------------
     if topic:
@@ -216,58 +313,77 @@ def quiz_me(mode: str = "adaptive", topic: str | None = None) -> str:
                     "Try mode='adaptive' to review weak spots."
                 ),
             })
-        chosen = pool[0]
+        sorted_pool = pool
         priority = "unattempted"
-        priority_reason = f"Unattempted card{topic_note} -- never been served before."
+        priority_reason = f"Unattempted card(s){topic_note} -- never been served before."
 
     elif mode == "weakest":
-        pool = sorted(candidates, key=lambda c: c["incorrect_count"], reverse=True)
-        chosen = pool[0]
+        sorted_pool = sorted(candidates, key=lambda c: c["incorrect_count"], reverse=True)
         priority = "weakest"
         priority_reason = (
-            f"Weakest card{topic_note} -- highest historical incorrect_count "
-            f"({chosen['incorrect_count']} error(s))."
+            f"Weakest card(s){topic_note} -- sorted by highest historical incorrect_count."
         )
 
     else:  # adaptive (default)
-        scored = [(c, _urgency(c)) for c in candidates]
-        scored.sort(key=lambda x: x[1], reverse=True)
-        chosen, score = scored[0]
+        scored = sorted(
+            [(c, _urgency(c)) for c in candidates],
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        sorted_pool = [c for c, _ in scored]
+        top_card, top_score = scored[0]
 
-        if chosen["total_attempts"] == 0:
+        if top_card["total_attempts"] == 0:
             priority = "unattempted"
             priority_reason = (
-                f"Unattempted card{topic_note} -- base urgency {score:.2f}. "
+                f"Unattempted card(s){topic_note} -- base urgency {top_score:.2f}. "
                 "Serving to ensure full deck coverage."
             )
-        elif chosen.get("consecutive_correct", 0) >= _MASTERED_STREAK:
+        elif top_card.get("consecutive_correct", 0) >= _MASTERED_STREAK:
             priority = "mastered_review"
             priority_reason = (
                 f"All cards{topic_note} appear mastered (streak >= {_MASTERED_STREAK}). "
-                f"Serving the least-mastered card for periodic review (urgency {score:.2f})."
+                f"Serving for periodic review (urgency {top_score:.2f})."
             )
         else:
             priority = "weak_spot"
             priority_reason = (
-                f"Weak spot{topic_note} -- urgency score {score:.2f} "
-                f"(incorrect_count={chosen['incorrect_count']}, "
-                f"consecutive_correct={chosen.get('consecutive_correct', 0)})."
+                f"Weak spot(s){topic_note} -- top urgency score {top_score:.2f} "
+                f"(incorrect_count={top_card['incorrect_count']}, "
+                f"consecutive_correct={top_card.get('consecutive_correct', 0)})."
             )
 
-    return json.dumps({
+    # ---- Deduplicate & cap at count -----------------------------------------
+    seen_ids: set[int] = set()
+    selected: list[dict] = []
+    for c in sorted_pool:
+        if c["id"] not in seen_ids:
+            seen_ids.add(c["id"])
+            selected.append({
+                "id": c["id"],
+                "question": c["question"],
+                "answer": c["answer"],
+                "incorrect_count": c["incorrect_count"],
+                "total_attempts": c["total_attempts"],
+                "consecutive_correct": c.get("consecutive_correct", 0),
+            })
+        if len(selected) >= count:
+            break
+
+    result: dict = {
         "status": "success",
         "mode": mode,
+        "count_requested": count,
+        "count_returned": len(selected),
         "priority": priority,
         "priority_reason": priority_reason,
-        "card": {
-            "id": chosen["id"],
-            "question": chosen["question"],
-            "answer": chosen["answer"],
-            "incorrect_count": chosen["incorrect_count"],
-            "total_attempts": chosen["total_attempts"],
-            "consecutive_correct": chosen.get("consecutive_correct", 0),
-        },
-    })
+        "cards": selected,
+    }
+    # Backward-compat: single-card alias when count=1
+    if len(selected) == 1:
+        result["card"] = selected[0]
+
+    return json.dumps(result)
 
 
 def record_answer(card_id: int, is_correct: bool) -> str:

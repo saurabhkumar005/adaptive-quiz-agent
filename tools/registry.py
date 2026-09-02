@@ -3,16 +3,24 @@ tools/registry.py
 ==================
 Dispatch Map (Tool Registry) pattern implementation.
 
-``TOOL_REGISTRY`` maps every tool name string to its callable, enabling O(1)
+TOOL_REGISTRY maps every tool name string to its callable, enabling O(1)
 dispatch in the agent loop with no if/elif chains.
 
-``AVAILABLE_SCHEMAS`` is the list of OpenAI-compatible JSON tool schemas sent
+AVAILABLE_SCHEMAS is the list of OpenAI-compatible JSON tool schemas sent
 to the Groq API on every inference call so the model knows which tools exist.
+
+Tools in this registry
+-----------------------
+  add_card            -- single-card insertion (1-3 explicit Q&A pairs)
+  add_cards_batch     -- bulk insertion in one tool call (4+ cards)
+  quiz_me             -- adaptive priority selection: mode / topic / count
+  record_answer       -- metric update with correct/incorrect decay
+  get_stats           -- full database diagnostic summary
 """
 
 from __future__ import annotations
 
-from .flashcards import add_card, quiz_me, record_answer, get_stats
+from .flashcards import add_card, add_cards_batch, quiz_me, record_answer, get_stats
 
 # ---------------------------------------------------------------------------
 # OpenAI-compatible JSON schemas
@@ -23,13 +31,12 @@ ADD_CARD_SCHEMA: dict = {
     "function": {
         "name": "add_card",
         "description": (
-            "Add a new flashcard to the study database. "
-            "Call this when the user provides BOTH a question AND an answer. "
-            "If the user asks you to create cards on a topic WITHOUT providing answers, "
-            "you MUST generate accurate questions and answers from your own knowledge "
-            "and call add_card autonomously -- do NOT ask the user for the answer. "
-            "Only ask the user for the answer when the topic is personal/subjective "
-            "(e.g. 'add a card about my meeting on Tuesday')."
+            "Add a single flashcard to the study database. "
+            "Use this for 1-3 cards when the user provides explicit Q&A pairs. "
+            "For bulk creation (4+ cards) or autonomous generation on a topic, "
+            "use add_cards_batch to avoid mid-task abandonment from token-budget limits. "
+            "If the user asks to create cards on a general knowledge topic WITHOUT answers, "
+            "generate accurate Q&A from your own knowledge -- do NOT ask the user."
         ),
         "parameters": {
             "type": "object",
@@ -49,19 +56,63 @@ ADD_CARD_SCHEMA: dict = {
     },
 }
 
+ADD_CARDS_BATCH_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "add_cards_batch",
+        "description": (
+            "Insert multiple flashcards in a single tool call. "
+            "ALWAYS use this instead of multiple add_card calls when: "
+            "(a) the user requests 4 or more cards, "
+            "(b) the user says 'add N cards on [topic]', or "
+            "(c) you are autonomously generating cards on a general knowledge topic. "
+            "Accepts a list of {question, answer} objects and inserts them atomically. "
+            "Resolves generation derailment from per-turn token-budget exhaustion "
+            "that previously caused the model to stop after 3 cards and hallucinate a mode switch."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "cards": {
+                    "type": "array",
+                    "description": (
+                        "List of flashcard objects to insert. "
+                        "Each must have 'question' and 'answer' string fields."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": {
+                                "type": "string",
+                                "description": "The question text.",
+                            },
+                            "answer": {
+                                "type": "string",
+                                "description": "The correct answer text.",
+                            },
+                        },
+                        "required": ["question", "answer"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["cards"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 QUIZ_ME_SCHEMA: dict = {
     "type": "function",
     "function": {
         "name": "quiz_me",
         "description": (
-            "Retrieve the highest-priority flashcard the student should be quizzed on next. "
-            "Supports three modes: 'adaptive' (default, uses urgency score formula), "
-            "'unattempted' (only cards never seen before), 'weakest' (highest error count). "
-            "Also accepts an optional 'topic' string for keyword filtering -- use this when "
-            "the user says 'quiz me on docker' or 'test me on ACID'. "
-            "Always call this before presenting any quiz question. "
-            "If the database is empty the tool returns status='empty' -- relay that message "
-            "to the user and ask them to add cards first."
+            "Retrieve the highest-priority flashcard(s) for the student to answer next. "
+            "ALWAYS call this before presenting any quiz question -- never rely on memory. "
+            "Returns status='empty' if deck is empty, status='no_match' if topic has no cards. "
+            "Use topic= to filter by keyword (e.g. topic='docker' for 'quiz me on docker'). "
+            "Use count=N to fetch N cards in ONE call (e.g. count=5 for '5 questions at once'). "
+            "NEVER fire multiple quiz_me calls in one turn -- use the count parameter instead."
         ),
         "parameters": {
             "type": "object",
@@ -71,10 +122,9 @@ QUIZ_ME_SCHEMA: dict = {
                     "enum": ["adaptive", "unattempted", "weakest"],
                     "description": (
                         "Selection strategy. "
-                        "'adaptive' (default): urgency score formula balancing weak spots "
-                        "and unattempted cards. "
+                        "'adaptive' (default): urgency-score formula balancing weak spots and unattempted cards. "
                         "'unattempted': strictly picks cards with total_attempts == 0. "
-                        "'weakest': strictly picks the card with the highest incorrect_count."
+                        "'weakest': strictly picks cards with the highest incorrect_count."
                     ),
                 },
                 "topic": {
@@ -82,7 +132,16 @@ QUIZ_ME_SCHEMA: dict = {
                     "description": (
                         "Optional keyword to filter cards by topic. "
                         "Case-insensitive substring match on question and answer text. "
-                        "E.g. 'docker', 'ACID', 'BST'."
+                        "Examples: 'docker', 'ACID', 'BST', 'india', 'bollywood'."
+                    ),
+                },
+                "count": {
+                    "type": "integer",
+                    "description": (
+                        "Number of cards to return (default 1, minimum 1). "
+                        "Use this when the user asks for multiple questions at once. "
+                        "Example: 'give me 5 questions' -> count=5. "
+                        "Returns at most the number of available matching candidates."
                     ),
                 },
             },
@@ -101,7 +160,9 @@ RECORD_ANSWER_SCHEMA: dict = {
             "Always call this after evaluating the student response so the adaptive "
             "engine can update weak-spot priorities. "
             "Correct answers increment consecutive_correct and decay incorrect_count. "
-            "Incorrect answers reset the streak and increment incorrect_count."
+            "Incorrect answers reset the streak and increment incorrect_count. "
+            "Use is_correct=True for partial/fuzzy matches when the core entity is "
+            "unambiguously identified (e.g. 'Ashutosh' for 'Ashutosh Gowariker' is correct)."
         ),
         "parameters": {
             "type": "object",
@@ -147,6 +208,7 @@ GET_STATS_SCHEMA: dict = {
 #: List of schemas sent to the Groq API on every call.
 AVAILABLE_SCHEMAS: list[dict] = [
     ADD_CARD_SCHEMA,
+    ADD_CARDS_BATCH_SCHEMA,
     QUIZ_ME_SCHEMA,
     RECORD_ANSWER_SCHEMA,
     GET_STATS_SCHEMA,
@@ -154,8 +216,9 @@ AVAILABLE_SCHEMAS: list[dict] = [
 
 #: O(1) dispatch map: tool_name -> callable.
 TOOL_REGISTRY: dict[str, callable] = {
-    "add_card":      add_card,
-    "quiz_me":       quiz_me,
-    "record_answer": record_answer,
-    "get_stats":     get_stats,
+    "add_card":        add_card,
+    "add_cards_batch": add_cards_batch,
+    "quiz_me":         quiz_me,
+    "record_answer":   record_answer,
+    "get_stats":       get_stats,
 }
