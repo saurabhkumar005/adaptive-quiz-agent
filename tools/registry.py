@@ -25,8 +25,11 @@ ADD_CARD_SCHEMA: dict = {
         "description": (
             "Add a new flashcard to the study database. "
             "Call this when the user provides BOTH a question AND an answer. "
-            "If the user only mentions a topic without an answer, ask them for "
-            "the answer first — do NOT call this tool with an empty answer."
+            "If the user asks you to create cards on a topic WITHOUT providing answers, "
+            "you MUST generate accurate questions and answers from your own knowledge "
+            "and call add_card autonomously -- do NOT ask the user for the answer. "
+            "Only ask the user for the answer when the topic is personal/subjective "
+            "(e.g. 'add a card about my meeting on Tuesday')."
         ),
         "parameters": {
             "type": "object",
@@ -52,14 +55,37 @@ QUIZ_ME_SCHEMA: dict = {
         "name": "quiz_me",
         "description": (
             "Retrieve the highest-priority flashcard the student should be quizzed on next. "
-            "The tool automatically selects the card with the most incorrect answers first "
-            "(adaptive weak-spot targeting). Call this before presenting any quiz question. "
-            "If the database is empty the tool returns status='empty' — relay that message "
+            "Supports three modes: 'adaptive' (default, uses urgency score formula), "
+            "'unattempted' (only cards never seen before), 'weakest' (highest error count). "
+            "Also accepts an optional 'topic' string for keyword filtering -- use this when "
+            "the user says 'quiz me on docker' or 'test me on ACID'. "
+            "Always call this before presenting any quiz question. "
+            "If the database is empty the tool returns status='empty' -- relay that message "
             "to the user and ask them to add cards first."
         ),
         "parameters": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["adaptive", "unattempted", "weakest"],
+                    "description": (
+                        "Selection strategy. "
+                        "'adaptive' (default): urgency score formula balancing weak spots "
+                        "and unattempted cards. "
+                        "'unattempted': strictly picks cards with total_attempts == 0. "
+                        "'weakest': strictly picks the card with the highest incorrect_count."
+                    ),
+                },
+                "topic": {
+                    "type": "string",
+                    "description": (
+                        "Optional keyword to filter cards by topic. "
+                        "Case-insensitive substring match on question and answer text. "
+                        "E.g. 'docker', 'ACID', 'BST'."
+                    ),
+                },
+            },
             "required": [],
             "additionalProperties": False,
         },
@@ -72,8 +98,10 @@ RECORD_ANSWER_SCHEMA: dict = {
         "name": "record_answer",
         "description": (
             "Record whether the student answered a flashcard correctly or incorrectly. "
-            "Always call this after evaluating the student's response so the adaptive "
-            "engine can update weak-spot priorities."
+            "Always call this after evaluating the student response so the adaptive "
+            "engine can update weak-spot priorities. "
+            "Correct answers increment consecutive_correct and decay incorrect_count. "
+            "Incorrect answers reset the streak and increment incorrect_count."
         ),
         "parameters": {
             "type": "object",
@@ -99,9 +127,9 @@ GET_STATS_SCHEMA: dict = {
         "name": "get_stats",
         "description": (
             "Return a full summary of the flashcard database: total card count, "
-            "per-card accuracy, and a ranked list of weak spots. Call this when "
-            "the user asks for a summary, diagnostic, or wants to know which topics "
-            "they are struggling with."
+            "unattempted count, mastered count, per-card accuracy, urgency scores, "
+            "and a ranked list of weak spots. Call this when the user asks for a "
+            "summary, diagnostic, or wants to know which topics they are struggling with."
         ),
         "parameters": {
             "type": "object",

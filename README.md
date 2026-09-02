@@ -1,20 +1,20 @@
-# 🃏 Flashcard Quiz Agent
+﻿# Flashcard Quiz Agent
 
-An autonomous, adaptive flashcard study tool powered by the [Groq](https://groq.com) inference API. The agent quizzes you interactively, remembers which cards you struggle with, and **automatically prioritises your weak spots** — not just random questions.
+An autonomous, adaptive flashcard study tool powered by the [Groq](https://groq.com) inference API. The agent quizzes you interactively, remembers which cards you struggle with, and **automatically prioritises your weak spots** -- not just random questions.
 
 ---
 
-## Tools
+## Tools & Capabilities
 
-The agent exposes two primary tools. `add_card(question, answer)` accepts a question string and its correct answer, stores a new flashcard record in a JSON-persisted database (`flashcard_db.json`), and returns a JSON confirmation containing the assigned card ID. `quiz_me()` queries the full card database, filters for cards with at least one recorded incorrect answer, and returns the card with the highest `incorrect_count` so the agent always targets the student's weakest area first; if no incorrect answers exist yet it falls back to the least-attempted card, ensuring every new card eventually gets coverage. A third internal tool, `record_answer(card_id, is_correct)`, is called automatically by the agent after evaluating the student's reply — it increments `total_attempts` and, when the answer was wrong, also increments `incorrect_count`, then flushes the updated record to disk so priority data persists across sessions.
+The agent exposes four tools through a dispatch-map registry (`tools/registry.py`). `add_card(question, answer)` persists a new flashcard record to a JSON-backed state store; when a user asks the agent to generate cards on a general knowledge topic without providing answers, the agent autonomously constructs accurate Q&A pairs from its own knowledge before calling this tool. `quiz_me(mode, topic)` implements the smart adaptive priority algorithm: it scores every candidate card with an urgency formula -- unattempted cards receive a fixed weight of 5.0, mastered cards (consecutive_correct >= 2) are capped at 0.5, and all others are scored as `(incorrect_count * 3.0) - (consecutive_correct * 1.5)` -- then returns the highest-scoring card along with a natural-language explanation of why it was chosen; the optional `topic` argument filters candidates by case-insensitive keyword match so requests like "quiz me on docker" are handled precisely. `record_answer(card_id, is_correct)` updates a card's metrics atomically: a correct answer increments `consecutive_correct` and decrements `incorrect_count` (floor zero) to decay the error weight, while an incorrect answer resets the streak and increments the error counter. `get_stats()` returns a ranked summary of every card including urgency score, mastery state, accuracy percentage, and unattempted/mastered aggregates so the agent can deliver accurate session diagnostics.
 
-## Memory
+## Memory Architecture
 
-The agent maintains two complementary forms of memory. Short-term conversational memory is implemented as a sliding-window over the message history: the system prompt is permanently anchored at index 0, and only the most recent six non-system turns are kept in the active context, preventing context-window overflow while preserving enough dialogue history for coherent multi-turn interaction. Long-term weak-spot memory is stored on disk in `flashcard_db.json` — specifically in each card's `incorrect_count` field — which survives process restarts. When `quiz_me()` is called in a new session it reads these persisted counts and immediately re-serves the card the student has historically struggled with most, making the agent's adaptive behaviour durable rather than session-scoped.
+The agent maintains two complementary and independent memory tiers. Short-term conversational memory is implemented as a **sliding window** over the message history (`core/agent.py`): the system prompt is permanently anchored at index 0, and only the most recent six non-system turns are kept in the active context at any time; this bounds the prompt size for cost and latency efficiency while retaining enough recent dialogue history for coherent multi-turn interaction without hallucinating earlier context. Long-term **persistent state** is stored on disk in `flashcard_db.json` via an atomic write pattern (write to `.tmp`, then `rename`) that prevents data corruption on crash; each card record stores `id`, `question`, `answer`, `incorrect_count`, `total_attempts`, `consecutive_correct`, and `last_attempted`, and this data survives process restarts completely -- when `quiz_me()` is called in a brand-new session it reads the persisted urgency data and immediately re-serves the card the student has historically struggled with most, making the adaptive behaviour durable and session-independent.
 
-## Honest Failure
+## Engineering Challenges & Production Bug Fixes
 
-During early development with a smaller 8B-parameter model, the agent repeatedly produced malformed tool-call arguments: the JSON payload would be corrupted by `<|channel|>commentary` token sequences bleeding into the structured output, causing `json.JSONDecodeError` in the dispatch loop and breaking multi-step reasoning chains entirely. Switching to the 120B-parameter `openai/gpt-oss-120b` model eliminated the token bleed, but the fix was not solely model size — the system prompt was also hardened with an explicit rule ("Output ONLY valid JSON when filling tool arguments; never output raw commentary outside the `content` field") that anchors the model's output format and prevents regression if a smaller model is substituted in future.
+Two critical production bugs were identified and resolved during testing. The first was **Card Starvation and Priority Lockout**: the original `quiz_me()` used a static error counter (`incorrect_count`) that never decayed, so a card answered incorrectly once and then correctly seven times in a row still retained `incorrect_count: 1` and was returned by every subsequent `quiz_me()` call, trapping the agent in an infinite loop serving the same card forever while all other cards -- including unattempted ones -- were permanently starved. The fix introduces a `consecutive_correct` streak field: each correct answer decrements `incorrect_count` (floor zero) and increments the streak; reaching a streak of 2 transitions the card to a mastered state (urgency capped at 0.5) that is deliberately deprioritised in favour of unattempted cards (urgency 5.0), solving both the starvation loop and the cold-start coverage gap. Additionally, `quiz_me()` was parameterised with `mode` and `topic` arguments -- the original function accepted no parameters, making it impossible for the agent to honour user intents like "quiz me on docker" or "show me cards I have not seen yet", causing silent tool blindness. The second bug was **Scratchpad and Meta-Reasoning Bleed**: when trapped serving the same card, the model entered token-repetition loops and leaked its internal conflict monologue directly into the user response. The system prompt was hardened with an explicit CRITICAL directive forbidding the model from outputting internal deliberation, policy commentary, or ellipsis sequences, and the execution loop was updated to detect empty or whitespace-only final responses and substitute a safe fallback message rather than surfacing a blank or garbled reply.
 
 ---
 
@@ -52,22 +52,23 @@ flashcard_agent/
 ├── requirements.txt
 ├── README.md
 ├── main.py               # Interactive CLI entry point
+├── generate_demo_notebook.py  # Regenerates demo.ipynb
 ├── tools/
 │   ├── __init__.py
-│   ├── flashcards.py     # add_card, quiz_me, record_answer + JSON persistence
+│   ├── flashcards.py     # add_card, quiz_me, record_answer, get_stats + JSON persistence
 │   └── registry.py       # TOOL_REGISTRY (dispatch map) + AVAILABLE_SCHEMAS
 ├── core/
 │   ├── __init__.py
 │   └── agent.py          # GroqAgent: ReAct loop + sliding-window memory
-└── demo.ipynb            # Notebook demonstrating the agent across 3 goals
+└── demo.ipynb            # Notebook demonstrating all scenarios and bug fixes
 ```
 
 ---
 
 ## Architecture Notes
 
-- **ReAct loop**: The agent runs a continuous plan-act loop — it calls tools, reads results, reasons over them, and loops until it has a final answer. It never just generates text directly.
-- **Dispatch Map pattern**: `TOOL_REGISTRY` is a plain `dict[str, callable]`. The loop executes `TOOL_REGISTRY[tool_name](**kwargs)` — O(1) lookup, zero `if/elif` chains.
-- **Adaptive selection**: `quiz_me()` sorts all cards by `incorrect_count` descending. The weakest card is always served first.
-- **Security**: All credentials loaded via `python-dotenv`. No hardcoded keys anywhere in the codebase.
+- **ReAct loop**: The agent runs a continuous plan-act loop -- it calls tools, reads results, reasons over them, and loops until it has a final answer. It never just generates text directly.
+- **Dispatch Map pattern**: `TOOL_REGISTRY` is a plain `dict[str, callable]`. The loop executes `TOOL_REGISTRY[tool_name](**kwargs)` -- O(1) lookup, zero `if/elif` chains.
+- **Urgency-score algorithm**: Cards are scored as `(incorrect_count * 3.0) - (consecutive_correct * 1.5)`, capped at 0.5 for mastered cards and fixed at 5.0 for unattempted cards.
 - **Atomic writes**: `flashcard_db.json` is written to a `.tmp` file first, then renamed, preventing data corruption on crash.
+- **Security**: All credentials loaded via `python-dotenv`. No hardcoded keys anywhere in the codebase.
