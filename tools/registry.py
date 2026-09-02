@@ -12,7 +12,7 @@ to the Groq API on every inference call so the model knows which tools exist.
 
 from __future__ import annotations
 
-from .flashcards import add_card, quiz_me, record_answer
+from .flashcards import add_card, quiz_me, record_answer, get_stats
 
 # ---------------------------------------------------------------------------
 # OpenAI-compatible JSON schemas
@@ -24,7 +24,9 @@ ADD_CARD_SCHEMA: dict = {
         "name": "add_card",
         "description": (
             "Add a new flashcard to the study database. "
-            "Call this whenever the user wants to create or save a new question-answer pair."
+            "Call this when the user provides BOTH a question AND an answer. "
+            "If the user only mentions a topic without an answer, ask them for "
+            "the answer first — do NOT call this tool with an empty answer."
         ),
         "parameters": {
             "type": "object",
@@ -51,7 +53,9 @@ QUIZ_ME_SCHEMA: dict = {
         "description": (
             "Retrieve the highest-priority flashcard the student should be quizzed on next. "
             "The tool automatically selects the card with the most incorrect answers first "
-            "(adaptive weak-spot targeting). Call this before presenting any quiz question."
+            "(adaptive weak-spot targeting). Call this before presenting any quiz question. "
+            "If the database is empty the tool returns status='empty' — relay that message "
+            "to the user and ask them to add cards first."
         ),
         "parameters": {
             "type": "object",
@@ -89,6 +93,25 @@ RECORD_ANSWER_SCHEMA: dict = {
     },
 }
 
+GET_STATS_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "get_stats",
+        "description": (
+            "Return a full summary of the flashcard database: total card count, "
+            "per-card accuracy, and a ranked list of weak spots. Call this when "
+            "the user asks for a summary, diagnostic, or wants to know which topics "
+            "they are struggling with."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+}
+
 # ---------------------------------------------------------------------------
 # Public exports
 # ---------------------------------------------------------------------------
@@ -98,11 +121,13 @@ AVAILABLE_SCHEMAS: list[dict] = [
     ADD_CARD_SCHEMA,
     QUIZ_ME_SCHEMA,
     RECORD_ANSWER_SCHEMA,
+    GET_STATS_SCHEMA,
 ]
 
 #: O(1) dispatch map: tool_name -> callable.
 TOOL_REGISTRY: dict[str, callable] = {
-    "add_card": add_card,
-    "quiz_me": quiz_me,
+    "add_card":      add_card,
+    "quiz_me":       quiz_me,
     "record_answer": record_answer,
+    "get_stats":     get_stats,
 }

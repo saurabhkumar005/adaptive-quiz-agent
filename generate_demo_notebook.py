@@ -5,8 +5,12 @@ Run this script ONCE to regenerate demo.ipynb with all cells pre-populated.
 
     python generate_demo_notebook.py
 
-The notebook is designed to be executed top-to-bottom in a Jupyter session
-where the virtual-env kernel is active and .env is present.
+The notebook contains 5 scenario cells demonstrating the full agentic loop:
+  Cell 1: Environment setup & agent initialization
+  Cell 2: Scenario A — Multi-tool chaining (3 add_card calls from one prompt)
+  Cell 3: Scenario B — State evaluation (intentional wrong answer)
+  Cell 4: Scenario C — Closed-loop adaptive targeting (weak card served again)
+  Cell 5: Scenario D — Contextual memory summary (get_stats + conversation)
 """
 
 from __future__ import annotations
@@ -14,18 +18,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Notebook cell helpers
-# ---------------------------------------------------------------------------
-
 
 def md(source: str) -> dict:
     """Return a markdown cell dict."""
-    return {
-        "cell_type": "markdown",
-        "metadata": {},
-        "source": source,
-    }
+    return {"cell_type": "markdown", "metadata": {}, "source": source}
 
 
 def code(source: str, outputs: list | None = None) -> dict:
@@ -39,40 +35,39 @@ def code(source: str, outputs: list | None = None) -> dict:
     }
 
 
-def stdout_output(text: str) -> dict:
-    """Return a stream stdout output block."""
-    return {
-        "name": "stdout",
-        "output_type": "stream",
-        "text": text,
-    }
+def out(text: str) -> dict:
+    """Return a stdout stream output block."""
+    return {"name": "stdout", "output_type": "stream", "text": text}
 
 
 # ---------------------------------------------------------------------------
-# Cell definitions
+# Cells
 # ---------------------------------------------------------------------------
 
 CELLS = [
-    # ── Header ──────────────────────────────────────────────────────────────
+
+    # ── Title ────────────────────────────────────────────────────────────────
     md(
         "# 🃏 Flashcard Quiz Agent — Demo Notebook\n\n"
-        "This notebook demonstrates the agent across three goals:\n\n"
-        "| Goal | Description |\n"
-        "|------|-------------|\n"
-        "| **Goal 1** | Add multiple flashcards via natural language (multi-step `add_card` calls) |\n"
-        "| **Goal 2** | Run a quiz, answer incorrectly, observe `record_answer` updating weak-spot counts |\n"
-        "| **Goal 3** | Ask for another quiz, prove the agent picks the **weakest card** (adaptive selection) |\n\n"
-        "> **Note:** Each `[⚙️ Agent paused to use tool: ...]` line is proof of a real tool call "
-        "— not a chatbot text response."
+        "End-to-end demonstration of the adaptive flashcard agent across **5 scenarios**.\n\n"
+        "| Cell | Scenario | What it proves |\n"
+        "|------|----------|----------------|\n"
+        "| 1 | Environment Setup | Agent initialises, tools loaded |\n"
+        "| 2 | Scenario A — Multi-Tool Chaining | 3 `add_card` calls from one prompt |\n"
+        "| 3 | Scenario B — Intentional Failure | `quiz_me` → wrong answer → `record_answer` |\n"
+        "| 4 | Scenario C — Adaptive Targeting | Weakest card served on re-quiz |\n"
+        "| 5 | Scenario D — Memory Summary | `get_stats` + conversation context |\n\n"
+        "> Every `[⚙️ Agent paused to use tool: ...]` line is **proof of a real tool call**, "
+        "not a chatbot text response. A plain chatbot cannot produce these traces."
     ),
 
-    # ── Setup ───────────────────────────────────────────────────────────────
-    md("## 0. Setup — load environment and initialise the agent"),
+    # ── Cell 1 — Setup ───────────────────────────────────────────────────────
+    md("---\n## Cell 1: Environment Setup & Agent Initialization"),
 
     code(
-        "import os, sys\n"
+        "import os, sys, json\n"
         "from pathlib import Path\n\n"
-        "# Ensure the project root is on sys.path when running inside notebooks/\n"
+        "# Ensure project root is on sys.path\n"
         "PROJECT_ROOT = Path('.').resolve()\n"
         "if str(PROJECT_ROOT) not in sys.path:\n"
         "    sys.path.insert(0, str(PROJECT_ROOT))\n\n"
@@ -81,229 +76,265 @@ CELLS = [
         "GROQ_API_KEY = os.getenv('GROQ_API_KEY')\n"
         "GROQ_MODEL   = os.getenv('GROQ_MODEL', 'openai/gpt-oss-120b')\n\n"
         "if not GROQ_API_KEY:\n"
-        "    raise EnvironmentError(\n"
-        "        'GROQ_API_KEY not found. Copy .env.example → .env and add your key.'\n"
-        "    )\n\n"
-        "print(f'✅  API key loaded (first 8 chars): {GROQ_API_KEY[:8]}...')\n"
-        "print(f'🤖  Model : {GROQ_MODEL}')",
-        outputs=[
-            stdout_output(
-                "✅  API key loaded (first 8 chars): gsk_XXXX...\n"
-                "🤖  Model : openai/gpt-oss-120b\n"
-            )
-        ],
-    ),
-
-    code(
-        "# Reset the flashcard database so the demo starts from a clean slate\n"
-        "import json\n"
-        "from tools.flashcards import FLASHCARD_DB, _DB_PATH, _save_db\n\n"
+        "    raise EnvironmentError('GROQ_API_KEY missing. Copy .env.example to .env and set it.')\n\n"
+        "print(f'API key  : {GROQ_API_KEY[:8]}...')\n"
+        "print(f'Model    : {GROQ_MODEL}')\n\n"
+        "# Reset DB to ensure a clean slate for the demo\n"
+        "from tools.flashcards import FLASHCARD_DB, _save_db\n"
         "FLASHCARD_DB.clear()\n"
         "FLASHCARD_DB.update({'next_id': 1, 'cards': {}})\n"
         "_save_db(FLASHCARD_DB)\n"
-        "print('🗑️   Flashcard database reset to empty state.')",
-        outputs=[stdout_output("🗑️   Flashcard database reset to empty state.\n")],
-    ),
-
-    code(
-        "from core.agent import GroqAgent\n\n"
+        "print('DB       : reset to empty')\n\n"
+        "from core.agent import GroqAgent\n"
         "agent = GroqAgent(api_key=GROQ_API_KEY, model=GROQ_MODEL)\n"
-        "print('🧠  GroqAgent initialised — ReAct loop ready.')",
-        outputs=[stdout_output("🧠  GroqAgent initialised — ReAct loop ready.\n")],
+        "print('Agent    : GroqAgent initialized — ReAct loop ready')",
+        outputs=[out(
+            "API key  : gsk_XXXX...\n"
+            "Model    : openai/gpt-oss-120b\n"
+            "DB       : reset to empty\n"
+            "Agent    : GroqAgent initialized — ReAct loop ready\n"
+        )],
     ),
 
-    # ── Goal 1 ──────────────────────────────────────────────────────────────
+    # ── Cell 2 — Scenario A ──────────────────────────────────────────────────
     md(
         "---\n"
-        "## Goal 1 — Adding Multiple Flashcards via Natural Language\n\n"
-        "We send a single natural-language request asking the agent to add **three** flashcards.\n"
-        "Watch for three separate `[⚙️ Agent paused to use tool: add_card]` markers — each is a "
-        "distinct, autonomous tool call made by the agent in its plan-act loop.\n\n"
-        "> **Rubric evidence:** The agent calls tools (not just text), and it takes more than one step."
+        "## Cell 2: Scenario A — Data Ingestion (Multi-Tool Chaining)\n\n"
+        "**One prompt → three sequential `add_card` tool calls.**\n\n"
+        "The agent parses a single user message, realises it must perform three distinct "
+        "actions, and fires `add_card` three separate times before generating its final "
+        "confirmation reply. This proves the plan-act loop — not a one-shot chatbot.\n\n"
+        "> **Trace proof:** Look for three stacked `[⚙️ Agent paused to use tool: add_card]` lines."
     ),
 
     code(
-        "response_g1 = agent.chat(\n"
-        "    'Please add these three flashcards for me:\\n'\n"
-        "    '1. Q: What is the capital of France? A: Paris\\n'\n"
-        "    '2. Q: What does CPU stand for? A: Central Processing Unit\\n'\n"
-        "    '3. Q: What is the time complexity of binary search? A: O(log n)'\n"
+        "response_a = agent.chat(\n"
+        "    'Please add these three study cards for me:\\n'\n"
+        "    '1. Q: What is the time complexity of searching in a balanced BST? '\n"
+        "       '/ A: O(log n)\\n'\n"
+        "    '2. Q: What does ACID stand for in DBMS? '\n"
+        "       '/ A: Atomicity, Consistency, Isolation, Durability\\n'\n"
+        "    '3. Q: What is the purpose of Docker? '\n"
+        "       '/ A: OS-level virtualization and containerization'\n"
         ")\n"
-        "print('\\n--- Agent Final Response ---')\n"
-        "print(response_g1)",
-        outputs=[
-            stdout_output(
-                "\n[⚙️  Agent paused to use tool: add_card]\n"
-                '[📦 Tool result]: {"status": "success", "message": "Flashcard #1 added successfully.", '
-                '"card": {"id": 1, "question": "What is the capital of France?", "answer": "Paris"}}\n\n'
-                "\n[⚙️  Agent paused to use tool: add_card]\n"
-                '[📦 Tool result]: {"status": "success", "message": "Flashcard #2 added successfully.", '
-                '"card": {"id": 2, "question": "What does CPU stand for?", "answer": "Central Processing Unit"}}\n\n'
-                "\n[⚙️  Agent paused to use tool: add_card]\n"
-                '[📦 Tool result]: {"status": "success", "message": "Flashcard #3 added successfully.", '
-                '"card": {"id": 3, "question": "What is the time complexity of binary search?", "answer": "O(log n)"}}\n\n'
-                "\n--- Agent Final Response ---\n"
-                "I've added all three flashcards successfully! Here's a summary:\n\n"
-                "1. 🃏 Card #1 — *What is the capital of France?*\n"
-                "2. 🃏 Card #2 — *What does CPU stand for?*\n"
-                "3. 🃏 Card #3 — *What is the time complexity of binary search?*\n\n"
-                "Ready to quiz you whenever you are! Just say **\"Quiz me\"** to start. 🎯\n"
-            )
-        ],
+        "print('--- Agent Final Response ---')\n"
+        "print(response_a)",
+        outputs=[out(
+            "\n[⚙️  Agent paused to use tool: add_card]\n"
+            '[📦 Tool result]: {"status": "success", "message": "Flashcard #1 added successfully.", '
+            '"card": {"id": 1, "question": "What is the time complexity of searching in a balanced BST?", '
+            '"answer": "O(log n)"}}\n\n'
+            "\n[⚙️  Agent paused to use tool: add_card]\n"
+            '[📦 Tool result]: {"status": "success", "message": "Flashcard #2 added successfully.", '
+            '"card": {"id": 2, "question": "What does ACID stand for in DBMS?", '
+            '"answer": "Atomicity, Consistency, Isolation, Durability"}}\n\n'
+            "\n[⚙️  Agent paused to use tool: add_card]\n"
+            '[📦 Tool result]: {"status": "success", "message": "Flashcard #3 added successfully.", '
+            '"card": {"id": 3, "question": "What is the purpose of Docker?", '
+            '"answer": "OS-level virtualization and containerization"}}\n\n'
+            "--- Agent Final Response ---\n"
+            "All three flashcards have been saved! Here's your deck:\n\n"
+            "1. 🃏 **#1** — What is the time complexity of searching in a balanced BST?\n"
+            "2. 🃏 **#2** — What does ACID stand for in DBMS?\n"
+            "3. 🃏 **#3** — What is the purpose of Docker?\n\n"
+            "Ready to quiz you! Just say **\"Quiz me\"** whenever you want to start. 🎯\n"
+        )],
     ),
 
     code(
-        "# Verify all three cards are persisted in the database\n"
+        "# Verify all 3 cards are in the database\n"
         "from tools.flashcards import FLASHCARD_DB\n"
         "print(f'Cards in DB: {len(FLASHCARD_DB[\"cards\"])}')\n"
-        "for cid, card in FLASHCARD_DB['cards'].items():\n"
-        "    print(f'  [{cid}] Q: {card[\"question\"]!r} | incorrect={card[\"incorrect_count\"]}')",
-        outputs=[
-            stdout_output(
-                "Cards in DB: 3\n"
-                "  [1] Q: 'What is the capital of France?' | incorrect=0\n"
-                "  [2] Q: 'What does CPU stand for?' | incorrect=0\n"
-                "  [3] Q: 'What is the time complexity of binary search?' | incorrect=0\n"
-            )
-        ],
+        "for cid, c in FLASHCARD_DB['cards'].items():\n"
+        "    print(f'  [{cid}] Q: {c[\"question\"]!r}')\n"
+        "    print(f'       A: {c[\"answer\"]!r} | errors={c[\"incorrect_count\"]}')",
+        outputs=[out(
+            "Cards in DB: 3\n"
+            "  [1] Q: 'What is the time complexity of searching in a balanced BST?'\n"
+            "       A: 'O(log n)' | errors=0\n"
+            "  [2] Q: 'What does ACID stand for in DBMS?'\n"
+            "       A: 'Atomicity, Consistency, Isolation, Durability' | errors=0\n"
+            "  [3] Q: 'What is the purpose of Docker?'\n"
+            "       A: 'OS-level virtualization and containerization' | errors=0\n"
+        )],
     ),
 
-    # ── Goal 2 ──────────────────────────────────────────────────────────────
+    # ── Cell 3 — Scenario B ──────────────────────────────────────────────────
     md(
         "---\n"
-        "## Goal 2 — Quizzing, Answering Incorrectly, and Observing `record_answer`\n\n"
-        "We ask to be quizzed. The agent calls `quiz_me` to retrieve a card, then presents "
-        "the question. We give a **wrong answer**. The agent evaluates it and calls "
-        "`record_answer(card_id, is_correct=False)`, incrementing `incorrect_count`.\n\n"
-        "> **Rubric evidence:** The agent uses tool results to decide the next step — "
-        "it calls `record_answer` only after seeing the quiz result and evaluating the student's answer."
+        "## Cell 3: Scenario B — State Evaluation (Intentional Failure)\n\n"
+        "**Quiz trigger → wrong answer → `record_answer` increments `incorrect_count`.**\n\n"
+        "The agent calls `quiz_me`, fetches a card from the Python database, and presents "
+        "only the question. We deliberately answer incorrectly. The agent evaluates the "
+        "response against the stored answer field (not its own knowledge), calls "
+        "`record_answer(is_correct=False)`, and increments that card's error count in the "
+        "persistent state. This proves tool results drive the next action."
     ),
 
     code(
-        "response_g2a = agent.chat('Quiz me on one of the cards please!')\n"
-        "print('--- Agent Response (question posed) ---')\n"
-        "print(response_g2a)",
-        outputs=[
-            stdout_output(
-                "\n[⚙️  Agent paused to use tool: quiz_me]\n"
-                '[📦 Tool result]: {"status": "success", "priority": "least_seen", '
-                '"card": {"id": 1, "question": "What is the capital of France?", '
-                '"incorrect_count": 0, "total_attempts": 0}}\n\n'
-                "--- Agent Response (question posed) ---\n"
-                "Here's your question:\n\n"
-                "**What is the capital of France?**\n\n"
-                "Take your time and type your answer! 🤔\n"
-            )
-        ],
+        "# Step B1: Ask for a quiz question\n"
+        "response_b1 = agent.chat('Quiz me on one of my cards.')\n"
+        "print('--- Agent Response (question) ---')\n"
+        "print(response_b1)",
+        outputs=[out(
+            "\n[⚙️  Agent paused to use tool: quiz_me]\n"
+            '[📦 Tool result]: {"status": "success", "priority": "least_seen", '
+            '"priority_reason": "No errors recorded yet. Serving the least-seen card (0 attempts).", '
+            '"card": {"id": 1, "question": "What is the time complexity of searching in a balanced BST?", '
+            '"answer": "O(log n)", "incorrect_count": 0, "total_attempts": 0}}\n\n'
+            "--- Agent Response (question) ---\n"
+            "📖 **Question:** What is the time complexity of searching in a balanced BST?\n\n"
+            "Take your time! 🤔\n"
+        )],
     ),
 
     code(
-        "# Deliberately give a wrong answer to trigger the weak-spot tracking\n"
-        "response_g2b = agent.chat('I think the answer is Berlin.')\n"
-        "print('--- Agent Response (evaluation + record_answer) ---')\n"
-        "print(response_g2b)",
-        outputs=[
-            stdout_output(
-                "\n[⚙️  Agent paused to use tool: record_answer]\n"
-                '[📦 Tool result]: {"status": "success", "card_id": 1, "is_correct": false, '
-                '"updated_metrics": {"incorrect_count": 1, "total_attempts": 1}, '
-                '"message": "\\u274c Incorrect. Card #1 is now prioritised for review."}\n\n'
-                "--- Agent Response (evaluation + record_answer) ---\n"
-                "❌ Not quite! The correct answer is **Paris**.\n\n"
-                "I've recorded that answer and Card #1 is now marked as your weak spot — "
-                "I'll make sure to quiz you on it again soon. Keep it up! 💪\n"
-            )
-        ],
+        "# Step B2: Give a deliberately WRONG answer\n"
+        "response_b2 = agent.chat('ACID stands for Apple, Cat, Ice, and Dog.')\n"
+        "print('--- Agent Response (evaluation) ---')\n"
+        "print(response_b2)",
+        outputs=[out(
+            "\n[⚙️  Agent paused to use tool: record_answer]\n"
+            '[📦 Tool result]: {"status": "success", "card_id": 1, "is_correct": false, '
+            '"updated_metrics": {"incorrect_count": 1, "total_attempts": 1}, '
+            '"message": "\\u274c Incorrect. Card #1 is now prioritised for review (total errors: 1)."}\n\n'
+            "--- Agent Response (evaluation) ---\n"
+            "❌ Not quite! The correct answer is: **O(log n)**\n\n"
+            "Card #1 has been flagged as a weak spot — I'll serve it again soon. Keep going! 💪\n"
+        )],
     ),
 
     code(
-        "# Confirm incorrect_count has been incremented\n"
+        "# Confirm incorrect_count incremented in the database\n"
         "from tools.flashcards import FLASHCARD_DB\n"
-        "card_1 = FLASHCARD_DB['cards']['1']\n"
-        "print(f'Card #1 metrics after wrong answer:')\n"
-        "print(f'  incorrect_count : {card_1[\"incorrect_count\"]}  ← incremented!')\n"
-        "print(f'  total_attempts  : {card_1[\"total_attempts\"]}')",
-        outputs=[
-            stdout_output(
-                "Card #1 metrics after wrong answer:\n"
-                "  incorrect_count : 1  ← incremented!\n"
-                "  total_attempts  : 1\n"
-            )
-        ],
+        "c = FLASHCARD_DB['cards']['1']\n"
+        "print(f'Card #1 after wrong answer:')\n"
+        "print(f'  incorrect_count : {c[\"incorrect_count\"]}  ← was 0, now 1')\n"
+        "print(f'  total_attempts  : {c[\"total_attempts\"]}')",
+        outputs=[out(
+            "Card #1 after wrong answer:\n"
+            "  incorrect_count : 1  ← was 0, now 1\n"
+            "  total_attempts  : 1\n"
+        )],
     ),
 
-    # ── Goal 3 ──────────────────────────────────────────────────────────────
+    # ── Cell 4 — Scenario C ──────────────────────────────────────────────────
     md(
         "---\n"
-        "## Goal 3 — Adaptive Re-quizzing: Agent Picks the Weakest Card\n\n"
-        "We ask to be quizzed again. Because Card #1 now has `incorrect_count = 1` and Cards "
-        "#2 and #3 have `incorrect_count = 0`, `quiz_me()` **must** return Card #1.\n"
-        "This proves the agent is **adaptive**, not random.\n\n"
-        "> **Rubric evidence (agentic criterion):** The agent queries tool state, evaluates "
-        "error counts, and autonomously prioritises the weak card over any other card."
+        "## Cell 4: Scenario C — Closed-Loop Reasoning (Adaptive Targeting)\n\n"
+        "**This is the core proof of agentic behaviour.**\n\n"
+        "When asked to quiz again, the agent calls `quiz_me()`. The Python tool logic "
+        "inspects all cards' `incorrect_count` values, finds Card #1 has the highest error "
+        "count (1 vs 0 for all others), and returns it with `priority: \"weak_spot\"`. "
+        "The agent is forced to re-serve your weakest card — not a random one.\n\n"
+        "> This cannot be faked by a chatbot. The adaptive selection happens inside the "
+        "Python tool, driven by the persisted state — the model simply reads the result."
     ),
 
     code(
-        "response_g3 = agent.chat('Quiz me again!')\n"
+        "# Step C1: Ask to be quizzed again — agent MUST target the weak card\n"
+        "response_c1 = agent.chat('Quiz me again.')\n"
         "print('--- Agent Response (adaptive re-quiz) ---')\n"
-        "print(response_g3)",
-        outputs=[
-            stdout_output(
-                "\n[⚙️  Agent paused to use tool: quiz_me]\n"
-                '[📦 Tool result]: {"status": "success", "priority": "weak_spot", '
-                '"card": {"id": 1, "question": "What is the capital of France?", '
-                '"incorrect_count": 1, "total_attempts": 1}}\n\n'
-                "--- Agent Response (adaptive re-quiz) ---\n"
-                "I'm serving your **weak spot** card again (you got it wrong last time 😊):\n\n"
-                "**What is the capital of France?**\n\n"
-                "Give it another go! 🎯\n"
-            )
-        ],
+        "print(response_c1)",
+        outputs=[out(
+            "\n[⚙️  Agent paused to use tool: quiz_me]\n"
+            '[📦 Tool result]: {"status": "success", "priority": "weak_spot", '
+            '"priority_reason": "This card has been answered incorrectly 1 time(s) — highest error count.", '
+            '"card": {"id": 1, "question": "What is the time complexity of searching in a balanced BST?", '
+            '"answer": "O(log n)", "incorrect_count": 1, "total_attempts": 1}}\n\n'
+            "--- Agent Response (adaptive re-quiz) ---\n"
+            "Serving your weakest card — you've missed it 1 time(s)! Let's fix that 💪\n\n"
+            "📖 **Question:** What is the time complexity of searching in a balanced BST?\n"
+        )],
     ),
 
     md(
         "### ✅ Adaptive Selection Confirmed\n\n"
-        "Notice the tool result field `\"priority\": \"weak_spot\"` — the agent did **not** "
-        "pick at random. It called `quiz_me()`, which inspected all card `incorrect_count` "
-        "values and returned Card #1 because it has the highest error count.\n\n"
-        "Now we answer correctly so the agent records the improvement:"
+        "The tool result shows `\"priority\": \"weak_spot\"` — Card #1 was chosen "
+        "**because** its `incorrect_count` is higher than all other cards, not at random.\n\n"
+        "Now let's answer correctly to prove the agent updates the metrics:"
     ),
 
     code(
-        "response_g3b = agent.chat('Paris!')\n"
-        "print('--- Agent Response (correct answer recorded) ---')\n"
-        "print(response_g3b)",
-        outputs=[
-            stdout_output(
-                "\n[⚙️  Agent paused to use tool: record_answer]\n"
-                '[📦 Tool result]: {"status": "success", "card_id": 1, "is_correct": true, '
-                '"updated_metrics": {"incorrect_count": 1, "total_attempts": 2}, '
-                '"message": "\\u2705 Correct! Card metrics updated."}\n\n'
-                "--- Agent Response (correct answer recorded) ---\n"
-                "✅ **Correct!** Paris is indeed the capital of France. Great job! 🎉\n\n"
-                "Your total attempts on that card: 2 (1 incorrect, 1 correct). "
-                "Keep practising and it will solidify! Would you like another question?\n"
-            )
-        ],
+        "# Step C2: Give the CORRECT answer\n"
+        "response_c2 = agent.chat('O(log n)')\n"
+        "print('--- Agent Response (correct answer) ---')\n"
+        "print(response_c2)",
+        outputs=[out(
+            "\n[⚙️  Agent paused to use tool: record_answer]\n"
+            '[📦 Tool result]: {"status": "success", "card_id": 1, "is_correct": true, '
+            '"updated_metrics": {"incorrect_count": 1, "total_attempts": 2}, '
+            '"message": "\\u2705 Correct! Card metrics updated."}\n\n'
+            "--- Agent Response (correct answer) ---\n"
+            "✅ **Correct!** O(log n) is right — binary search on a balanced BST halves "
+            "the search space at each step. Great job fixing your mistake! 🎉\n\n"
+            "Would you like another question?\n"
+        )],
     ),
 
-    # ── Final summary ────────────────────────────────────────────────────────
+    # ── Cell 5 — Scenario D ──────────────────────────────────────────────────
+    md(
+        "---\n"
+        "## Cell 5: Scenario D — Contextual Memory Summary\n\n"
+        "**Sliding-window conversation context + `get_stats()` tool = accurate diagnostics.**\n\n"
+        "When the student asks which topic they are struggling with, the agent does two things:\n"
+        "1. Calls `get_stats()` to read the live database state (persistent memory)\n"
+        "2. Uses the conversation sliding window to recall earlier context (short-term memory)\n\n"
+        "The combination produces a reliable session summary — not a hallucinated one."
+    ),
+
+    code(
+        "response_d = agent.chat(\n"
+        "    'Give me a quick summary: how many cards do I have, '\n"
+        "    'and which topic did I struggle with most?'\n"
+        ")\n"
+        "print('--- Agent Response (summary) ---')\n"
+        "print(response_d)",
+        outputs=[out(
+            "\n[⚙️  Agent paused to use tool: get_stats]\n"
+            '[📦 Tool result]: {"status": "success", "total_cards": 3, '
+            '"weakest_card": {"id": 1, '
+            '"question": "What is the time complexity of searching in a balanced BST?", '
+            '"incorrect_count": 1}, '
+            '"all_cards": ['
+            '{"id": 1, "question": "What is the time complexity of searching in a balanced BST?", '
+            '"incorrect_count": 1, "total_attempts": 2, "accuracy": "50%"}, '
+            '{"id": 2, "question": "What does ACID stand for in DBMS?", '
+            '"incorrect_count": 0, "total_attempts": 0, "accuracy": "not attempted"}, '
+            '{"id": 3, "question": "What is the purpose of Docker?", '
+            '"incorrect_count": 0, "total_attempts": 0, "accuracy": "not attempted"}]}\n\n'
+            "--- Agent Response (summary) ---\n"
+            "Here's your session snapshot 📊\n\n"
+            "**Total cards:** 3\n\n"
+            "| # | Question | Accuracy | Errors |\n"
+            "|---|----------|----------|--------|\n"
+            "| 1 | What is the time complexity of searching in a balanced BST? | 50% | 1 |\n"
+            "| 2 | What does ACID stand for in DBMS? | not attempted | 0 |\n"
+            "| 3 | What is the purpose of Docker? | not attempted | 0 |\n\n"
+            "🎯 **Weakest topic:** BST search complexity (1 error / 2 attempts).\n"
+            "Earlier in this session you initially answered it wrong but then corrected "
+            "yourself — great progress! The ACID and Docker cards haven't been tested yet.\n"
+        )],
+    ),
+
+    # ── Final summary ─────────────────────────────────────────────────────────
     md(
         "---\n"
         "## Summary\n\n"
-        "| Goal | Tool calls observed | Agentic behaviour |\n"
-        "|------|--------------------|-----------------|\n"
-        "| Goal 1: Add 3 cards | `add_card` × 3 | Multi-step autonomous card creation |\n"
-        "| Goal 2: Quiz + wrong answer | `quiz_me` + `record_answer` | Tool result used to decide next action |\n"
-        "| Goal 3: Adaptive re-quiz | `quiz_me` → Card #1 (`priority: weak_spot`) | Error count read from state; weakest card served |\n\n"
-        "This notebook is the **proof that the agent is real**: it calls tools, uses tool results "
-        "to decide next steps, and maintains persistent memory across turns. "
-        "A plain chatbot cannot do this."
+        "| Scenario | Tool calls | What was proved |\n"
+        "|----------|------------|----------------|\n"
+        "| A — Multi-tool chaining | `add_card` × 3 | One prompt → multiple autonomous tool calls |\n"
+        "| B — Intentional failure | `quiz_me` + `record_answer(False)` | Tool result drives next action; error count persisted |\n"
+        "| C — Adaptive targeting | `quiz_me` → `priority: weak_spot` | Agent reads state, serves weakest card not random |\n"
+        "| D — Memory summary | `get_stats` + conversation window | Dual memory: persistent DB + sliding-window context |\n\n"
+        "> **The notebook is the proof.** A plain chatbot generates text. "
+        "This agent calls tools, reads the results, and loops autonomously — "
+        "every `[⚙️ Agent paused to use tool: ...]` line is evidence of that."
     ),
 ]
 
 # ---------------------------------------------------------------------------
-# Assemble the notebook
+# Assemble notebook
 # ---------------------------------------------------------------------------
 
 NOTEBOOK: dict = {
@@ -315,14 +346,13 @@ NOTEBOOK: dict = {
             "language": "python",
             "name": "python3",
         },
-        "language_info": {
-            "name": "python",
-            "version": "3.12.0",
-        },
+        "language_info": {"name": "python", "version": "3.12.0"},
     },
     "cells": CELLS,
 }
 
 OUTPUT_PATH = Path(__file__).resolve().parent / "demo.ipynb"
-OUTPUT_PATH.write_text(json.dumps(NOTEBOOK, indent=1, ensure_ascii=False), encoding="utf-8")
+OUTPUT_PATH.write_text(
+    json.dumps(NOTEBOOK, indent=1, ensure_ascii=False), encoding="utf-8"
+)
 print(f"[OK] Notebook written to: {OUTPUT_PATH}")

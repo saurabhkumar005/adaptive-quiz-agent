@@ -1,10 +1,11 @@
 """
 tools/flashcards.py
 ====================
-Persistent flashcard state store and the three agent tools:
-  - add_card(question, answer)      → adds a new card
-  - quiz_me()                       → returns the highest-priority weak card
+Persistent flashcard state store and the four agent tools:
+  - add_card(question, answer)         → adds a new card
+  - quiz_me()                          → returns the highest-priority weak card
   - record_answer(card_id, is_correct) → updates card metrics
+  - get_stats()                        → returns a full database summary
 
 State is persisted to ``flashcard_db.json`` in the project root so that
 weak-spot data survives across agent sessions.
@@ -71,6 +72,15 @@ def add_card(question: str, answer: str) -> str:
     str
         A JSON-encoded confirmation object containing the new card's id.
     """
+    question = question.strip()
+    answer = answer.strip()
+
+    if not question or not answer:
+        return json.dumps({
+            "status": "error",
+            "message": "Both 'question' and 'answer' must be non-empty strings.",
+        })
+
     card_id = FLASHCARD_DB["next_id"]
     FLASHCARD_DB["next_id"] += 1
 
@@ -105,20 +115,23 @@ def quiz_me() -> str:
          by ``incorrect_count`` — the weakest card is served first.
       2. If no card has been answered incorrectly yet, fall back to the card
          with the fewest ``total_attempts`` (least-seen card).
-      3. If the database is empty, return an instructional prompt.
+      3. If the database is empty, return a clear instructional message.
 
     Returns
     -------
     str
-        A JSON-encoded object containing the selected card's id and question,
-        plus metadata to help the agent explain priority reasoning.
+        A JSON-encoded object containing the selected card's id, question,
+        answer (for agent evaluation only), and priority metadata.
     """
     cards = list(FLASHCARD_DB["cards"].values())
 
     if not cards:
         return json.dumps({
             "status": "empty",
-            "message": "No flashcards found. Use add_card to add some first!",
+            "message": (
+                "Your flashcard deck is empty! "
+                "Please add some cards first using add_card before quizzing."
+            ),
         })
 
     # Weak cards: at least one incorrect answer recorded
@@ -127,14 +140,23 @@ def quiz_me() -> str:
     if weak_cards:
         chosen = max(weak_cards, key=lambda c: c["incorrect_count"])
         priority = "weak_spot"
+        priority_reason = (
+            f"This card has been answered incorrectly "
+            f"{chosen['incorrect_count']} time(s) — highest error count."
+        )
     else:
         # Fall back: least-attempted card (highest novelty)
         chosen = min(cards, key=lambda c: c["total_attempts"])
         priority = "least_seen"
+        priority_reason = (
+            f"No errors recorded yet. Serving the least-seen card "
+            f"({chosen['total_attempts']} attempts)."
+        )
 
     return json.dumps({
         "status": "success",
         "priority": priority,
+        "priority_reason": priority_reason,
         "card": {
             "id": chosen["id"],
             "question": chosen["question"],
@@ -186,6 +208,63 @@ def record_answer(card_id: int, is_correct: bool) -> str:
         "message": (
             "✅ Correct! Card metrics updated."
             if is_correct
-            else f"❌ Incorrect. Card #{card_id} is now prioritised for review."
+            else f"❌ Incorrect. Card #{card_id} is now prioritised for review "
+                 f"(total errors: {card['incorrect_count']})."
         ),
+    })
+
+
+def get_stats() -> str:
+    """
+    Return a complete summary of the flashcard database state.
+
+    Includes total card count, per-card metrics, and a ranked list
+    of weak spots so the agent can give an accurate diagnostic summary.
+
+    Returns
+    -------
+    str
+        A JSON-encoded statistics object.
+    """
+    cards = list(FLASHCARD_DB["cards"].values())
+    total = len(cards)
+
+    if total == 0:
+        return json.dumps({
+            "status": "empty",
+            "total_cards": 0,
+            "message": "No flashcards in the database yet.",
+        })
+
+    # Sort: most incorrect first, then most attempted
+    sorted_cards = sorted(
+        cards,
+        key=lambda c: (-c["incorrect_count"], -c["total_attempts"])
+    )
+
+    card_summaries = [
+        {
+            "id": c["id"],
+            "question": c["question"],
+            "incorrect_count": c["incorrect_count"],
+            "total_attempts": c["total_attempts"],
+            "accuracy": (
+                f"{round((1 - c['incorrect_count'] / c['total_attempts']) * 100)}%"
+                if c["total_attempts"] > 0 else "not attempted"
+            ),
+        }
+        for c in sorted_cards
+    ]
+
+    weakest = sorted_cards[0] if sorted_cards[0]["incorrect_count"] > 0 else None
+
+    return json.dumps({
+        "status": "success",
+        "total_cards": total,
+        "weakest_card": {
+            "id": weakest["id"],
+            "question": weakest["question"],
+            "incorrect_count": weakest["incorrect_count"],
+        } if weakest else None,
+        "all_cards": card_summaries,
     })
