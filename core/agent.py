@@ -53,7 +53,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from groq import Groq, BadRequestError
+from groq import Groq, BadRequestError, APIError, RateLimitError
 
 from tools.registry import AVAILABLE_SCHEMAS, TOOL_REGISTRY
 
@@ -161,6 +161,13 @@ You have six tools available:
 - Output ONLY valid JSON in tool arguments. No commentary inside JSON.
 - Never hallucinate answers, card IDs, or database state.
 - Keep all replies concise and encouraging.
+
+"STRICT DOMAIN GUARDRAILS:\n"
+        "1. Off-Topic Queries: If the user asks about non-study/non-academic topics (e.g., dating advice, pop gossip, "
+        "personal opinions), politely refuse and state that you only assist with studying and flashcard quizzing.\n"
+        "2. Technical/Study Queries: If the user asks an academic or technical question (e.g., 'What is RAG pipeline?'), "
+        "provide a concise explanation (under 3 sentences), and then proactively offer: 'Would you like me to add this to your flashcard deck?'\n"
+        "3. Never execute tools on off-topic questions. Always prioritize quizzing and deck operations."
 """
 
 
@@ -193,7 +200,11 @@ class GroqAgent:
     # Public API
     # ------------------------------------------------------------------
 
-    def chat(self, user_message: str) -> str:
+    def chat(
+        self,
+        user_message: str,
+        on_tool_event: Any = None,
+    ) -> str:
         """
         Process a user message through the full ReAct plan-act loop and
         return the agent final natural-language response.
@@ -202,6 +213,16 @@ class GroqAgent:
         ----------
         user_message : str
             Raw text from the user / student.
+        on_tool_event : callable or None, optional
+            Optional callback invoked once for every tool call executed during
+            this turn.  The callback receives a single dict with the keys:
+
+                ``tool_name``   (str)  -- name of the tool called
+                ``arguments``   (dict) -- parsed keyword arguments
+                ``result``      (str)  -- raw JSON string returned by the tool
+
+            When ``None`` (default) the loop behaves exactly as before, so
+            ``main.py`` and the terminal workflow are completely unaffected.
 
         Returns
         -------
@@ -209,7 +230,7 @@ class GroqAgent:
             The agent final response after completing all tool calls.
         """
         self._append_user_message(user_message)
-        return self._run_loop()
+        return self._run_loop(on_tool_event=on_tool_event)
 
     # ------------------------------------------------------------------
     # Memory management
@@ -235,7 +256,7 @@ class GroqAgent:
     # ReAct loop
     # ------------------------------------------------------------------
 
-    def _run_loop(self) -> str:
+    def _run_loop(self, on_tool_event: Any = None) -> str:
         """
         Continuous plan-act execution loop.
 
@@ -264,6 +285,10 @@ class GroqAgent:
                     tools=AVAILABLE_SCHEMAS,
                     tool_choice="auto",
                 )
+            except RateLimitError as e:
+                return f"[Rate Limit Exceeded]: Daily token quota reached. Details: {e.message}"
+            except APIError as e:
+                return f"[API Error]: {e}"
             except BadRequestError as exc:
                 # ---- Malformed tool-argument JSON produced by the model ----
                 error_body = exc.body or {}
@@ -371,6 +396,18 @@ class GroqAgent:
                             })
 
                 print(f"[Tool result]: {tool_result}\n")
+
+                # Fire the optional UI callback with structured event data
+                if callable(on_tool_event):
+                    try:
+                        parsed_args = json.loads(raw_args) if raw_args else {}
+                    except json.JSONDecodeError:
+                        parsed_args = {"_raw": raw_args}
+                    on_tool_event({
+                        "tool_name": tool_name,
+                        "arguments": parsed_args,
+                        "result": tool_result,
+                    })
 
                 # Append the tool result so the model can reason over it
                 self._history.append({

@@ -1,74 +1,230 @@
 ﻿# Flashcard Quiz Agent
 
-An autonomous, adaptive flashcard study tool powered by the [Groq](https://groq.com) inference API. The agent quizzes you interactively, remembers which cards you struggle with, and **automatically prioritises your weak spots** -- not just random questions.
+An autonomous, adaptive flashcard study tool powered by the [Groq](https://groq.com) inference API and a **Streamlit web UI**.
+
+The agent quizzes you interactively, remembers which cards you struggle with, and **automatically prioritises your weak spots** — not just random questions.
+Use it through the browser UI **or** the classic terminal CLI — both interfaces share the exact same agent brain.
 
 ---
 
-## Tools & Capabilities
+## ✨ Features at a Glance
 
-The agent exposes four tools through a dispatch-map registry (`tools/registry.py`). `add_card(question, answer)` persists a new flashcard record to a JSON-backed state store; when a user asks the agent to generate cards on a general knowledge topic without providing answers, the agent autonomously constructs accurate Q&A pairs from its own knowledge before calling this tool. `quiz_me(mode, topic)` implements the smart adaptive priority algorithm: it scores every candidate card with an urgency formula -- unattempted cards receive a fixed weight of 5.0, mastered cards (consecutive_correct >= 2) are capped at 0.5, and all others are scored as `(incorrect_count * 3.0) - (consecutive_correct * 1.5)` -- then returns the highest-scoring card along with a natural-language explanation of why it was chosen; the optional `topic` argument filters candidates by case-insensitive keyword match so requests like "quiz me on docker" are handled precisely. `record_answer(card_id, is_correct)` updates a card's metrics atomically: a correct answer increments `consecutive_correct` and decrements `incorrect_count` (floor zero) to decay the error weight, while an incorrect answer resets the streak and increments the error counter. `get_stats()` returns a ranked summary of every card including urgency score, mastery state, accuracy percentage, and unattempted/mastered aggregates so the agent can deliver accurate session diagnostics.
-
-## Memory Architecture
-
-The agent maintains two complementary and independent memory tiers. Short-term conversational memory is implemented as a **sliding window** over the message history (`core/agent.py`): the system prompt is permanently anchored at index 0, and only the most recent six non-system turns are kept in the active context at any time; this bounds the prompt size for cost and latency efficiency while retaining enough recent dialogue history for coherent multi-turn interaction without hallucinating earlier context. Long-term **persistent state** is stored on disk in `flashcard_db.json` via an atomic write pattern (write to `.tmp`, then `rename`) that prevents data corruption on crash; each card record stores `id`, `question`, `answer`, `incorrect_count`, `total_attempts`, `consecutive_correct`, and `last_attempted`, and this data survives process restarts completely -- when `quiz_me()` is called in a brand-new session it reads the persisted urgency data and immediately re-serves the card the student has historically struggled with most, making the adaptive behaviour durable and session-independent.
-
-## Engineering Challenges & Production Bug Fixes
-
-Two critical production bugs were identified and resolved during testing. The first was **Card Starvation and Priority Lockout**: the original `quiz_me()` used a static error counter (`incorrect_count`) that never decayed, so a card answered incorrectly once and then correctly seven times in a row still retained `incorrect_count: 1` and was returned by every subsequent `quiz_me()` call, trapping the agent in an infinite loop serving the same card forever while all other cards -- including unattempted ones -- were permanently starved. The fix introduces a `consecutive_correct` streak field: each correct answer decrements `incorrect_count` (floor zero) and increments the streak; reaching a streak of 2 transitions the card to a mastered state (urgency capped at 0.5) that is deliberately deprioritised in favour of unattempted cards (urgency 5.0), solving both the starvation loop and the cold-start coverage gap. Additionally, `quiz_me()` was parameterised with `mode` and `topic` arguments -- the original function accepted no parameters, making it impossible for the agent to honour user intents like "quiz me on docker" or "show me cards I have not seen yet", causing silent tool blindness. The second bug was **Scratchpad and Meta-Reasoning Bleed**: when trapped serving the same card, the model entered token-repetition loops and leaked its internal conflict monologue directly into the user response. The system prompt was hardened with an explicit CRITICAL directive forbidding the model from outputting internal deliberation, policy commentary, or ellipsis sequences, and the execution loop was updated to detect empty or whitespace-only final responses and substitute a safe fallback message rather than surfacing a blank or garbled reply.
-
----
-
-## Quick Start
-
-```bash
-# 1. Clone and enter the project
-git clone <your-repo-url>
-cd flashcard_agent
-
-# 2. Create and activate a virtual environment
-python -m venv venv
-source venv/Scripts/activate      # Git Bash on Windows
-# .\venv\Scripts\Activate.ps1    # PowerShell
-
-# 3. Install dependencies
-pip install -r requirements.txt
-
-# 4. Configure your API key
-cp .env.example .env
-# Edit .env and set GROQ_API_KEY=<your_key>
-
-# 5. Run the interactive agent
-python main.py
-```
+| Feature | Details |
+|---|---|
+| **ReAct Agent Loop** | Reason → Act → Observe → Repeat until a final answer is ready |
+| **Sliding-Window Memory** | System prompt always anchored; last 6 turns kept in context |
+| **Smart Adaptive Priority** | Urgency scoring — weak spots promoted, mastered cards retired |
+| **Persistent Deck** | `flashcard_db.json` survives restarts; atomic write prevents corruption |
+| **Streamlit Web UI** | Live KPI sidebar, tool-call traces, quick-action buttons, deck inspector |
+| **Terminal CLI** | Classic `python main.py` workflow — fully independent of the UI |
+| **Batch Card Creation** | `add_cards_batch` inserts 4+ cards in a single tool call |
 
 ---
 
-## Project Structure
+## 📁 Project Structure
 
 ```
 flashcard_agent/
-├── .env.example          # API key template (never commit .env)
+├── .env.example              # API key template  ← copy this to .env
 ├── .gitignore
 ├── requirements.txt
 ├── README.md
-├── main.py               # Interactive CLI entry point
-├── generate_demo_notebook.py  # Regenerates demo.ipynb
-├── tools/
-│   ├── __init__.py
-│   ├── flashcards.py     # add_card, quiz_me, record_answer, get_stats + JSON persistence
-│   └── registry.py       # TOOL_REGISTRY (dispatch map) + AVAILABLE_SCHEMAS
+├── app.py                    # ✨ Streamlit web interface
+├── main.py                   # Terminal CLI entry point
+├── flashcard_db.json         # Auto-created on first run (gitignored)
 ├── core/
 │   ├── __init__.py
-│   └── agent.py          # GroqAgent: ReAct loop + sliding-window memory
-└── demo.ipynb            # Notebook demonstrating all scenarios and bug fixes
+│   └── agent.py              # GroqAgent: ReAct loop + sliding-window memory
+└── tools/
+    ├── __init__.py
+    ├── flashcards.py         # add_card, add_cards_batch, quiz_me, record_answer, get_stats
+    └── registry.py           # TOOL_REGISTRY (dispatch map) + AVAILABLE_SCHEMAS
 ```
 
 ---
 
-## Architecture Notes
+## 🚀 Quick Start — Step-by-Step from Zero
 
-- **ReAct loop**: The agent runs a continuous plan-act loop -- it calls tools, reads results, reasons over them, and loops until it has a final answer. It never just generates text directly.
-- **Dispatch Map pattern**: `TOOL_REGISTRY` is a plain `dict[str, callable]`. The loop executes `TOOL_REGISTRY[tool_name](**kwargs)` -- O(1) lookup, zero `if/elif` chains.
-- **Urgency-score algorithm**: Cards are scored as `(incorrect_count * 3.0) - (consecutive_correct * 1.5)`, capped at 0.5 for mastered cards and fixed at 5.0 for unattempted cards.
-- **Atomic writes**: `flashcard_db.json` is written to a `.tmp` file first, then renamed, preventing data corruption on crash.
-- **Security**: All credentials loaded via `python-dotenv`. No hardcoded keys anywhere in the codebase.
+### Step 1 — Get a Free Groq API Key
+
+1. Go to **https://console.groq.com/keys**
+2. Sign up or log in (free account, no credit card required)
+3. Click **"Create API Key"**, give it a name, and **copy the key**
+   *(it looks like `gsk_xxxxxxxxxxxxxxxxxxxx`)*
+
+> **⚠ Important:** Keep your API key secret. Never commit `.env` to git — it is already in `.gitignore`.
+
+---
+
+### Step 2 — Clone the Repository
+
+```bash
+git clone https://github.com/your-username/flashcard_agent.git
+cd flashcard_agent
+```
+
+---
+
+### Step 3 — Create a Python Virtual Environment
+
+**Windows (PowerShell):**
+```powershell
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+```
+
+**Windows (Git Bash / CMD):**
+```bash
+python -m venv venv
+source venv/Scripts/activate
+```
+
+**macOS / Linux:**
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
+> **Tip:** Your prompt will show `(venv)` once the environment is active.
+
+---
+
+### Step 4 — Install Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+This installs: `groq`, `streamlit`, `pandas`, `python-dotenv`, and Jupyter tools.
+
+---
+
+### Step 5 — Configure Your API Key
+
+```bash
+# Windows (PowerShell / Git Bash)
+cp .env.example .env
+
+# Windows (CMD only)
+copy .env.example .env
+
+# macOS / Linux
+cp .env.example .env
+```
+
+Now open `.env` in any text editor and replace the placeholder:
+
+```env
+# .env  — DO NOT COMMIT THIS FILE
+GROQ_API_KEY=your_groq_api_key_here    # ← paste the key from Step 1 here
+GROQ_MODEL=openai/gpt-oss-120b
+```
+
+> **Where to get the key:** https://console.groq.com/keys — free tier gives generous daily limits.
+
+---
+
+### Step 6 — Run the Agent
+
+#### Option A: Streamlit Web UI *(recommended)*
+
+```bash
+streamlit run app.py
+```
+
+Then open **http://localhost:8501** in your browser.
+
+**What you get in the UI:**
+- Live sidebar with **Total Cards / Unattempted / Weak Spots / Mastered** KPI metrics (auto-refreshed after every agent turn)
+- One-click **Quick Action** buttons:
+  - ⚡ Quiz Adaptive — picks your highest-priority card
+  - 🎯 Focus Weak Spots — targets cards you are struggling with
+  - 🆕 Unattempted Card — shows a brand-new card you have never seen
+  - 📊 Full Deck Summary — full mastery and urgency report
+- Expandable **Live Deck Inspector** — a DataFrame table of every card with its stats
+- Full **chat interface** with collapsible **tool-call traces** showing exactly which tools the agent called, with what arguments, and what they returned
+
+#### Option B: Terminal CLI
+
+```bash
+python main.py
+```
+
+Same agent, same persistent deck — just a plain text REPL in your terminal.
+
+---
+
+## 💬 Example Prompts
+
+Once the agent is running (in either mode), try these:
+
+```
+Add a card: Q: What is Docker? / A: OS-level virtualisation platform
+Add 5 cards on Python data structures
+Quiz me
+Quiz me on Docker
+Quiz me on weak topics
+Show me a card I have never seen before. Use unattempted mode.
+Give me a summary of all cards, showing mastery and urgency scores.
+```
+
+---
+
+## ⚙️ How It Works
+
+### ReAct Loop (`core/agent.py`)
+
+```
+User message
+    │
+    ▼
+Groq API  (model reasons + selects a tool)
+    │
+    ├── Tool call?  ──► Execute tool ──► Append result to history ──► loop back
+    │
+    └── No tool?    ──► Final text response ──► Return to user
+```
+
+### Adaptive Priority Algorithm (`tools/flashcards.py`)
+
+| Card State | Urgency Score |
+|---|---|
+| Never attempted | **5.0** (highest — ensures full deck coverage first) |
+| Has errors, not yet mastered | `(incorrect_count × 3.0) − (consecutive_correct × 1.5)` |
+| Mastered (consecutive correct ≥ 2) | **0.5** (deprioritised — periodic refresh only) |
+
+### Tool Registry (`tools/registry.py`)
+
+| Tool | Purpose |
+|---|---|
+| `add_card(question, answer)` | Add a single flashcard |
+| `add_cards_batch(cards)` | Bulk-insert 4+ cards in one tool call |
+| `quiz_me(mode, topic, count)` | Fetch highest-priority card(s) |
+| `record_answer(card_id, is_correct)` | Update metrics with correct/incorrect decay |
+| `get_stats()` | Full deck diagnostic summary |
+
+---
+
+## 🔐 Security Notes
+
+- `.env` is listed in `.gitignore` — your API key will **never** be accidentally committed
+- `.env.example` is committed as a safe template with a placeholder value only
+- No API keys are hardcoded anywhere in the source code
+
+---
+
+## 📋 Requirements
+
+- Python **3.10** or newer
+- A free [Groq API key](https://console.groq.com/keys)
+- Internet connection (calls the Groq inference API)
+
+---
+
+## 🏗️ Architecture Notes
+
+- **Dispatch Map pattern** — `TOOL_REGISTRY` is a plain `dict[str, callable]`: O(1) tool lookup, zero `if/elif` chains
+- **Atomic writes** — `flashcard_db.json` is written to `.tmp` then renamed: crash-safe persistence
+- **Sliding window** — Only the last 6 non-system turns are kept in the LLM context: cost-efficient and hallucination-resistant
+- **Streamlit session state** — `GroqAgent` is instantiated once per browser tab and lives in `st.session_state`: full memory persists across UI reruns
+- **Tool-call visibility** — The UI captures every tool event via an `on_tool_event` callback injected into `GroqAgent.chat()`: the terminal CLI is completely unaffected (callback defaults to `None`)

@@ -1,5 +1,7 @@
-groq
+﻿groq
 python-dotenv
 jupyter
 ipykernel
 nbformat
+streamlit
+pandas
