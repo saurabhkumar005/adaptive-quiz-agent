@@ -72,7 +72,7 @@ def main() -> None:
         if not user_input:
             continue
 
-        if user_input.lower() in {"quit", "exit", "q"}:
+        if user_input.lower() in {"quit", "exit", "q", "end", "stop"}:
             print("\n👋  Session ended. Goodbye!")
             break
 
