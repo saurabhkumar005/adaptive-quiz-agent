@@ -367,6 +367,28 @@ def _trial_exhausted() -> bool:
     )
 
 
+def _render_gate_banner(context: str = "quizzing and chatting") -> None:
+    """Renders the trial-exhausted gatekeeper banner and 30-sec BYOK helper accordion."""
+    st.markdown(f"""
+    <div class="gate-banner">
+      <div style="font-size:2.5rem">\U0001f3ab</div>
+      <h3 style="color:#f59e0b;margin:8px 0">You have used your {FREE_TRIAL_LIMIT} free trial interactions!</h3>
+      <p style="color:#94a3b8">To continue {context} with zero limits, please enter your free Groq API key in the sidebar.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    with st.expander("\U0001f511 How to get your free Groq API key (takes 30 seconds)", expanded=True):
+        st.markdown("""
+        **Step 1.** Go to **[https://console.groq.com/keys](https://console.groq.com/keys)** — completely free, no credit card required.
+
+        **Step 2.** Click **"Create API Key"**, give it any name, and copy the key (starts with `gsk_`).
+
+        **Step 3.** Paste the key into the **sidebar text box** at the top labelled *"Your Groq API Key"*.
+
+        You will be switched to unlimited usage immediately — no page reload needed.
+        """)
+
+
 def _ensure_agent() -> None:
     """
     Create or recreate the GroqAgent whenever the active API key changes.
@@ -668,6 +690,11 @@ with tab_game:
         </div>
         """, unsafe_allow_html=True)
 
+        # ── Trial gatekeeper ──────────────────────────────────────────────────
+        if _trial_exhausted():
+            _render_gate_banner("playing quizzes")
+            st.stop()
+
         if kpi["total"] == 0:
             st.info(
                 "\U0001f4ed **Your deck is empty!**\n\n"
@@ -739,6 +766,13 @@ with tab_game:
 
     # ---- QUESTION -----------------------------------------------------------
     elif phase == "question":
+        # ── Trial gatekeeper ──────────────────────────────────────────────────
+        if _trial_exhausted():
+            _render_gate_banner("playing quizzes")
+            if st.button("\U0001f3e0 Back to Home"):
+                st.session_state.game_phase = "home"
+                st.rerun()
+            st.stop()
         if st.session_state.current_card is None:
             raw    = _quiz_me_raw(
                 mode  = st.session_state.quiz_mode,
@@ -828,6 +862,11 @@ with tab_game:
             st.rerun()
 
         if skipped:
+            if _trial_exhausted():
+                st.warning("Trial limit reached (5/5). Please enter your Groq API key in the sidebar.")
+                st.rerun()
+            if not _using_custom_key():
+                st.session_state.trial_turns_used += 1
             st.session_state.last_correct     = None
             st.session_state.session_streak   = 0
             st.session_state.last_xp          = 0
@@ -838,7 +877,12 @@ with tab_game:
         if submitted:
             if not user_ans.strip():
                 st.warning("Please type your answer before submitting!")
+            elif _trial_exhausted():
+                st.warning("Trial limit reached (5/5). Please enter your Groq API key in the sidebar.")
+                st.rerun()
             else:
+                if not _using_custom_key():
+                    st.session_state.trial_turns_used += 1
                 is_correct = _fuzzy_match(user_ans.strip(), card["answer"])
                 _record_answer_raw(card["id"], is_correct)
                 prev_wrong = st.session_state.wrong_streak_count
@@ -916,23 +960,33 @@ with tab_game:
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        b1, b2, b3 = st.columns(3)
-        with b1:
-            if st.button("\u25b6\ufe0f  Next Question", use_container_width=True, type="primary"):
-                st.session_state.game_phase   = "question"
-                st.session_state.current_card = None
-                st.session_state.last_correct = None
-                st.rerun()
-        with b2:
-            if st.button("\U0001f504  Change Mode", use_container_width=True):
-                st.session_state.game_phase   = "home"
-                st.session_state.current_card = None
-                st.rerun()
-        with b3:
-            if st.button("\U0001f3e0  Home", use_container_width=True):
-                st.session_state.game_phase   = "home"
-                st.session_state.current_card = None
-                st.rerun()
+        # ── Gate check on feedback screen ────────────────────────────────────
+        if _trial_exhausted():
+            _render_gate_banner("playing more quizzes")
+            b_home = st.columns([1, 2, 1])[1]
+            with b_home:
+                if st.button("\U0001f3e0  Home", use_container_width=True):
+                    st.session_state.game_phase   = "home"
+                    st.session_state.current_card = None
+                    st.rerun()
+        else:
+            b1, b2, b3 = st.columns(3)
+            with b1:
+                if st.button("\u25b6\ufe0f  Next Question", use_container_width=True, type="primary"):
+                    st.session_state.game_phase   = "question"
+                    st.session_state.current_card = None
+                    st.session_state.last_correct = None
+                    st.rerun()
+            with b2:
+                if st.button("\U0001f504  Change Mode", use_container_width=True):
+                    st.session_state.game_phase   = "home"
+                    st.session_state.current_card = None
+                    st.rerun()
+            with b3:
+                if st.button("\U0001f3e0  Home", use_container_width=True):
+                    st.session_state.game_phase   = "home"
+                    st.session_state.current_card = None
+                    st.rerun()
 
         st.markdown("---")
         st.markdown("#### \U0001f4ca Session Scoreboard")
@@ -968,30 +1022,7 @@ with tab_chat:
 
     # ── Trial gate banner ─────────────────────────────────────────────────────
     if _trial_exhausted():
-        st.markdown("""
-        <div class="gate-banner">
-          <div style="font-size:2.5rem">\U0001f3ab</div>
-          <h3 style="color:#f59e0b;margin:8px 0">You have used your 5 free trial interactions!</h3>
-          <p style="color:#94a3b8">To continue quizzing with zero limits, enter your free Groq API key in the sidebar.</p>
-        </div>
-        """, unsafe_allow_html=True)
-
-        with st.expander("\U0001f511 How to get your free Groq API key (30 seconds)", expanded=True):
-            st.markdown("""
-            **Step 1.** Go to **https://console.groq.com/keys** — completely free, no credit card.
-
-            **Step 2.** Click **"Create API Key"**, give it any name, and copy the key (starts with `gsk_`).
-
-            **Step 3.** Paste the key into the **sidebar text box** at the top labelled *"Your Groq API Key"*.
-
-            You will be switched to unlimited usage immediately \u2014 no page reload needed.
-            """)
-
-        st.info(
-            "\U0001f4a1 While you set up your key, you can still use the **\U0001f3ae Quiz Game** tab freely "
-            "(the game tab uses direct tool calls and doesn't count against the trial).",
-            icon="\u2139\ufe0f",
-        )
+        _render_gate_banner("chatting with the agent")
         # Hard-stop the chat section — no input rendered
         st.stop()
 

@@ -215,8 +215,9 @@ The 💬 **Ask the Agent** tab is a full conversational interface:
 
 When deployed as a shared demo or hosted app:
 
-- **Guests get 5 free interactions** on the host's Groq API key
-- After the trial, the chat input is disabled and a friendly banner explains exactly how to get a free Groq key
+- **Guests get 5 free interactions total** on the host's Groq API key across both Quiz Mode and Agent Mode
+- Each quiz question answered and each agent conversation turn counts towards the 5-turn free quota
+- Once the 5 chances are reached, both the Quiz Game and Agent Chat are locked behind a polite gate banner explaining how to get a free Groq key
 - Users can paste their own key (`gsk_...`) into the sidebar at any time to get **unlimited usage immediately**
 - The key is used only within the browser session — it is never stored on disk or transmitted anywhere except directly to Groq's API
 
@@ -327,4 +328,4 @@ Try Model[0] → Model[1] → Model[2] → Model[3]  (on RateLimitError / APIErr
 - **Multi-model cascade** — `GroqAgent._models[]` is loaded from `GROQ_FALLBACK_MODELS` env var or `DEFAULT_FALLBACK_MODELS`; `_current_model_index` advances on transient errors
 - **Streamlit session state** — `GroqAgent` is instantiated once per browser tab; re-created only when the user's API key changes
 - **Tool-call visibility** — The UI captures every tool event via an `on_tool_event` callback injected into `GroqAgent.chat()`; the terminal CLI is completely unaffected (callback defaults to `None`)
-- **Game tab is LLM-free** — The Quiz Game tab calls `quiz_me` and `record_answer` directly (no API call); instant feedback with zero latency and zero trial count impact
+- **Unified Free-Trial Gatekeeper** — Both Quiz Game turns and Agent Chat turns increment the trial counter on the host key. Once the 5-interaction quota is reached, both tabs require a custom BYOK key to resume.
