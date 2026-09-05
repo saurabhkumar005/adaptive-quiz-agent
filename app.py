@@ -37,25 +37,29 @@ st.set_page_config(
 FREE_TRIAL_LIMIT: int = 5  # Free turns allowed on the host key
 
 # ---------------------------------------------------------------------------
-# Safe API / Host Key Resolution (avoids StreamlitSecretNotFoundError)
 # ---------------------------------------------------------------------------
-HOST_GROQ_KEY: str | None = None
+# Safe Config Resolution (st.secrets on Cloud -> os.getenv for .env)
+# ---------------------------------------------------------------------------
+def _get_config(key: str, default: str = "") -> str:
+    """Safely resolve config from st.secrets (Cloud) or os.environ (.env)."""
+    try:
+        if key in st.secrets:
+            val = str(st.secrets[key]).strip()
+            if val:
+                return val
+    except Exception:
+        pass
+    return os.getenv(key, default).strip()
 
-# Safely query st.secrets without crashing if secrets.toml is missing
-try:
-    if "GROQ_API_KEY" in st.secrets:
-        val = str(st.secrets["GROQ_API_KEY"]).strip()
-        if val:
-            HOST_GROQ_KEY = val
-except Exception:
-    pass
 
-if not HOST_GROQ_KEY:
-    env_val = os.getenv("GROQ_API_KEY", "").strip()
-    if env_val:
-        HOST_GROQ_KEY = env_val
+HOST_GROQ_KEY: str | None = _get_config("GROQ_API_KEY") or None
+GROQ_MODEL: str = _get_config("GROQ_MODEL", "openai/gpt-oss-120b")
 
-GROQ_MODEL: str = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+# If GROQ_FALLBACK_MODELS was configured in st.secrets, ensure os.environ has it
+# so core.agent.GroqAgent picks it up as well
+_fallback_models_cfg = _get_config("GROQ_FALLBACK_MODELS")
+if _fallback_models_cfg and "GROQ_FALLBACK_MODELS" not in os.environ:
+    os.environ["GROQ_FALLBACK_MODELS"] = _fallback_models_cfg
 
 # ---------------------------------------------------------------------------
 # Local imports (after env loaded)
@@ -594,12 +598,22 @@ with st.sidebar:
             unsafe_allow_html=True,
         )
 
-    # Active model badge
+    # Active model badge with fallback status indicator
     active_model = st.session_state.agent.get_active_model() if st.session_state.agent else GROQ_MODEL
-    st.markdown(
-        f'<div style="margin-top:6px"><span class="model-badge">🤖 {active_model}</span></div>',
-        unsafe_allow_html=True,
-    )
+    if st.session_state.agent and st.session_state.agent._current_model_index > 0:
+        fallback_num = st.session_state.agent._current_model_index
+        st.markdown(
+            f'<div style="margin-top:6px">'
+            f'<span class="model-badge" style="border-color:#f59e0b;color:#fbbf24;" title="Primary model experienced rate limits or errors. Successfully failed over to backup model.">'
+            f'🤖 {active_model} <span style="font-size:0.65rem;background:#f59e0b;color:#000;padding:1px 5px;border-radius:4px;margin-left:4px;font-weight:800">FALLBACK #{fallback_num}</span>'
+            f'</span></div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f'<div style="margin-top:6px"><span class="model-badge" title="Active inference model">🤖 {active_model}</span></div>',
+            unsafe_allow_html=True,
+        )
 
     st.divider()
 
@@ -715,9 +729,7 @@ with tab_game:
 
         if _trial_exhausted():
             _render_gate_banner("playing quizzes")
-            st.stop()
-
-        if kpi["total"] == 0:
+        elif kpi["total"] == 0:
             st.info(
                 "📬 **Your deck is empty!**\n\n"
                 "Switch to the **💬 Ask the Agent** tab and type:\n"
@@ -790,149 +802,152 @@ with tab_game:
     elif phase == "question":
         if _trial_exhausted():
             _render_gate_banner("playing quizzes")
-            if st.button("🏠 Back to Home"):
-                st.session_state.game_phase = "home"
-                st.rerun()
-            st.stop()
-
-        if st.session_state.current_card is None:
-            raw = _quiz_me_raw(
-                mode=st.session_state.quiz_mode,
-                topic=st.session_state.quiz_topic or None,
-                count=1,
-            )
-            result = json.loads(raw)
-            status = result.get("status", "")
-
-            if status in ("empty", "no_match", "no_unattempted"):
-                st.warning(f"⚠️ {result.get('message', 'No cards available.')}")
+            b_home = st.columns([1, 2, 1])[1]
+            with b_home:
                 if st.button("🏠 Back to Home"):
                     st.session_state.game_phase = "home"
                     st.rerun()
-                st.stop()
-
-            card = result.get("card") or (result.get("cards") or [{}])[0]
-            st.session_state.current_card = card
-            st.session_state.correct_answer_text = card.get("answer", "")
-            st.session_state.priority_reason = result.get("priority_reason", "")
-
-        card = st.session_state.current_card
-        streak = st.session_state.session_streak
-
-        hdr1, hdr2, hdr3 = st.columns([3, 2, 2])
-        with hdr1:
-            mode_label = {
-                "adaptive": "🎲 Adaptive",
-                "unattempted": "🆕 Explorer",
-                "weakest": "🔥 Weak Spot",
-            }.get(st.session_state.quiz_mode, "Quiz")
-            topic_label = f" — {st.session_state.quiz_topic}" if st.session_state.quiz_topic else ""
-            st.markdown(f"### {mode_label}{topic_label}")
-        with hdr2:
-            if streak >= 3:
-                st.markdown(
-                    f'<div style="text-align:center;padding-top:8px">'
-                    f'<span class="streak-pill">🔥 {streak} streak!</span></div>',
-                    unsafe_allow_html=True)
-        with hdr3:
-            st.markdown(
-                f'<div style="text-align:right;padding-top:12px;color:#c4b5fd;font-weight:700">'
-                f'⚡ {st.session_state.session_xp} XP</div>',
-                unsafe_allow_html=True)
-
-        mode_badge = {
-            "adaptive": "Adaptive Pick",
-            "unattempted": "New Card!",
-            "weakest": "Weak Spot",
-        }.get(st.session_state.quiz_mode, "Question")
-
-        meta_parts: list[str] = [f"Card #{card['id']}"]
-        if card.get("total_attempts", 0) == 0:
-            meta_parts.append("🆕 First time!")
         else:
-            meta_parts.append(f"Seen {card['total_attempts']}x")
-        if card.get("incorrect_count", 0) > 0:
-            meta_parts.append(f"❌ {card['incorrect_count']} mistake(s)")
-        if card.get("consecutive_correct", 0) >= _MASTERED_STREAK:
-            meta_parts.append("✅ Mastered")
+            if st.session_state.current_card is None:
+                raw = _quiz_me_raw(
+                    mode=st.session_state.quiz_mode,
+                    topic=st.session_state.quiz_topic or None,
+                    count=1,
+                )
+                result = json.loads(raw)
+                status = result.get("status", "")
 
-        st.markdown(f"""
-        <div class="q-card">
-          <div class="badge-top">🎮 {mode_badge}</div>
-          <h2>{card["question"]}</h2>
-          <div class="q-meta">{"  &bull;  ".join(meta_parts)}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        if st.session_state.priority_reason:
-            st.caption(f"💡 {st.session_state.priority_reason}")
-
-        with st.form("ans_form", clear_on_submit=True):
-            user_ans = st.text_input(
-                "Your Answer",
-                placeholder="Type your answer here and press Enter or click Submit...",
-                label_visibility="collapsed",
-            )
-            btn1, btn2, btn3 = st.columns([4, 2, 2])
-            submitted = btn1.form_submit_button("✅  Submit Answer", use_container_width=True, type="primary")
-            skipped   = btn2.form_submit_button("⏭️  Skip Card",    use_container_width=True)
-            go_home   = btn3.form_submit_button("🏠  Home",           use_container_width=True)
-
-        if go_home:
-            st.session_state.game_phase = "home"
-            st.session_state.current_card = None
-            st.rerun()
-
-        if skipped:
-            if _trial_exhausted():
-                st.warning("Trial limit reached (5/5). Please enter your Groq API key in the sidebar.")
-                st.rerun()
-            if not _using_custom_key():
-                st.session_state.trial_turns_used += 1
-            st.session_state.last_correct = None
-            st.session_state.session_streak = 0
-            st.session_state.last_xp = 0
-            st.session_state.game_phase = "feedback"
-            st.session_state.current_card = None
-            st.rerun()
-
-        if submitted:
-            if not user_ans.strip():
-                st.warning("Please type your answer before submitting!")
-            elif _trial_exhausted():
-                st.warning("Trial limit reached (5/5). Please enter your Groq API key in the sidebar.")
-                st.rerun()
-            else:
-                if not _using_custom_key():
-                    st.session_state.trial_turns_used += 1
-                is_correct = _fuzzy_match(user_ans.strip(), card["answer"])
-                _record_answer_raw(card["id"], is_correct)
-                prev_wrong = st.session_state.wrong_streak_count
-                st.session_state.session_total += 1
-
-                if is_correct:
-                    st.session_state.session_correct += 1
-                    st.session_state.session_streak += 1
-                    st.session_state.session_best_streak = max(
-                        st.session_state.session_best_streak,
-                        st.session_state.session_streak,
-                    )
-                    xp = _calc_xp(st.session_state.session_streak, card)
-                    st.session_state.session_xp += xp
-                    st.session_state.total_xp += xp
-                    st.session_state.last_xp = xp
-                    st.session_state.last_wrong_count = prev_wrong
-                    st.session_state.wrong_streak_count = 0
+                if status in ("empty", "no_match", "no_unattempted"):
+                    st.warning(f"⚠️ {result.get('message', 'No cards available.')}")
+                    b_home = st.columns([1, 2, 1])[1]
+                    with b_home:
+                        if st.button("🏠 Back to Home"):
+                            st.session_state.game_phase = "home"
+                            st.rerun()
                 else:
-                    st.session_state.session_streak = 0
-                    st.session_state.wrong_streak_count = prev_wrong + 1
-                    st.session_state.last_xp = 0
+                    card = result.get("card") or (result.get("cards") or [{}])[0]
+                    st.session_state.current_card = card
+                    st.session_state.correct_answer_text = card.get("answer", "")
+                    st.session_state.priority_reason = result.get("priority_reason", "")
 
-                st.session_state.last_correct = is_correct
-                st.session_state.game_phase = "feedback"
-                st.session_state.current_card = None
-                _check_achievements()
-                st.rerun()
+            card = st.session_state.current_card
+            if card:
+                streak = st.session_state.session_streak
+
+                hdr1, hdr2, hdr3 = st.columns([3, 2, 2])
+                with hdr1:
+                    mode_label = {
+                        "adaptive": "🎲 Adaptive",
+                        "unattempted": "🆕 Explorer",
+                        "weakest": "🔥 Weak Spot",
+                    }.get(st.session_state.quiz_mode, "Quiz")
+                    topic_label = f" — {st.session_state.quiz_topic}" if st.session_state.quiz_topic else ""
+                    st.markdown(f"### {mode_label}{topic_label}")
+                with hdr2:
+                    if streak >= 3:
+                        st.markdown(
+                            f'<div style="text-align:center;padding-top:8px">'
+                            f'<span class="streak-pill">🔥 {streak} streak!</span></div>',
+                            unsafe_allow_html=True)
+                with hdr3:
+                    st.markdown(
+                        f'<div style="text-align:right;padding-top:12px;color:#c4b5fd;font-weight:700">'
+                        f'⚡ {st.session_state.session_xp} XP</div>',
+                        unsafe_allow_html=True)
+
+                mode_badge = {
+                    "adaptive": "Adaptive Pick",
+                    "unattempted": "New Card!",
+                    "weakest": "Weak Spot",
+                }.get(st.session_state.quiz_mode, "Question")
+
+                meta_parts: list[str] = [f"Card #{card['id']}"]
+                if card.get("total_attempts", 0) == 0:
+                    meta_parts.append("🆕 First time!")
+                else:
+                    meta_parts.append(f"Seen {card['total_attempts']}x")
+                if card.get("incorrect_count", 0) > 0:
+                    meta_parts.append(f"❌ {card['incorrect_count']} mistake(s)")
+                if card.get("consecutive_correct", 0) >= _MASTERED_STREAK:
+                    meta_parts.append("✅ Mastered")
+
+                st.markdown(f"""
+                <div class="q-card">
+                  <div class="badge-top">🎮 {mode_badge}</div>
+                  <h2>{card["question"]}</h2>
+                  <div class="q-meta">{"  &bull;  ".join(meta_parts)}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                if st.session_state.priority_reason:
+                    st.caption(f"💡 {st.session_state.priority_reason}")
+
+                with st.form("ans_form", clear_on_submit=True):
+                    user_ans = st.text_input(
+                        "Your Answer",
+                        placeholder="Type your answer here and press Enter or click Submit...",
+                        label_visibility="collapsed",
+                    )
+                    btn1, btn2, btn3 = st.columns([4, 2, 2])
+                    submitted = btn1.form_submit_button("✅  Submit Answer", use_container_width=True, type="primary")
+                    skipped   = btn2.form_submit_button("⏭️  Skip Card",    use_container_width=True)
+                    go_home   = btn3.form_submit_button("🏠  Home",           use_container_width=True)
+
+                if go_home:
+                    st.session_state.game_phase = "home"
+                    st.session_state.current_card = None
+                    st.rerun()
+
+                if skipped:
+                    if _trial_exhausted():
+                        st.warning("Trial limit reached (5/5). Please enter your Groq API key in the sidebar.")
+                        st.rerun()
+                    if not _using_custom_key():
+                        st.session_state.trial_turns_used += 1
+                    st.session_state.last_correct = None
+                    st.session_state.session_streak = 0
+                    st.session_state.last_xp = 0
+                    st.session_state.game_phase = "feedback"
+                    st.session_state.current_card = None
+                    st.rerun()
+
+                if submitted:
+                    if not user_ans.strip():
+                        st.warning("Please type your answer before submitting!")
+                    elif _trial_exhausted():
+                        st.warning("Trial limit reached (5/5). Please enter your Groq API key in the sidebar.")
+                        st.rerun()
+                    else:
+                        if not _using_custom_key():
+                            st.session_state.trial_turns_used += 1
+                        is_correct = _fuzzy_match(user_ans.strip(), card["answer"])
+                        _record_answer_raw(card["id"], is_correct)
+                        prev_wrong = st.session_state.wrong_streak_count
+                        st.session_state.session_total += 1
+
+                        if is_correct:
+                            st.session_state.session_correct += 1
+                            st.session_state.session_streak += 1
+                            st.session_state.session_best_streak = max(
+                                st.session_state.session_best_streak,
+                                st.session_state.session_streak,
+                            )
+                            xp = _calc_xp(st.session_state.session_streak, card)
+                            st.session_state.session_xp += xp
+                            st.session_state.total_xp += xp
+                            st.session_state.last_xp = xp
+                            st.session_state.last_wrong_count = prev_wrong
+                            st.session_state.wrong_streak_count = 0
+                        else:
+                            st.session_state.session_streak = 0
+                            st.session_state.wrong_streak_count = prev_wrong + 1
+                            st.session_state.last_xp = 0
+
+                        st.session_state.last_correct = is_correct
+                        st.session_state.game_phase = "feedback"
+                        st.session_state.current_card = None
+                        _check_achievements()
+                        st.rerun()
 
     # ---- FEEDBACK -----------------------------------------------------------
     elif phase == "feedback":
@@ -1043,20 +1058,18 @@ with tab_chat:
     # ── Trial gate banner ─────────────────────────────────────────────────────
     if _trial_exhausted():
         _render_gate_banner("chatting with the agent")
-        # Hard-stop the chat section — no input rendered
-        st.stop()
 
     # ── Example Prompt Launcher ──────────────────────────────────────────────
-    st.markdown("#### 💡 Example Prompts — click any to send instantly")
-    for category, prompts in EXAMPLE_PROMPTS.items():
-        with st.expander(category, expanded=False):
-            cols = st.columns(2)
-            for i, p in enumerate(prompts):
-                label = p if len(p) <= 58 else p[:55] + "…"
-                if cols[i % 2].button(label, key=f"ep_{hash(p)}", use_container_width=True):
-                    st.session_state.pending_prompt = p
-
-    st.divider()
+    if not _trial_exhausted():
+        st.markdown("#### 💡 Example Prompts — click any to send instantly")
+        for category, prompts in EXAMPLE_PROMPTS.items():
+            with st.expander(category, expanded=False):
+                cols = st.columns(2)
+                for i, p in enumerate(prompts):
+                    label = p if len(p) <= 58 else p[:55] + "…"
+                    if cols[i % 2].button(label, key=f"ep_{hash(p)}", use_container_width=True):
+                        st.session_state.pending_prompt = p
+        st.divider()
 
     # ── Chat history ──────────────────────────────────────────────────────────
     for msg in st.session_state.messages:
@@ -1114,6 +1127,10 @@ with tab_chat:
         _run_agent(p)
         st.rerun()
 
-    if user_text := st.chat_input("Ask the agent to quiz you, add cards, or show stats…"):
-        _run_agent(user_text)
-        st.rerun()
+    # ── Chat Input ───────────────────────────────────────────────────────────
+    if _trial_exhausted():
+        st.chat_input("🚫 Free trial exhausted. Enter your Groq API key in the sidebar to chat.", disabled=True)
+    else:
+        if user_text := st.chat_input("Ask the agent to quiz you, add cards, or show stats…"):
+            _run_agent(user_text)
+            st.rerun()
