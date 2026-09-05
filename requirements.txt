@@ -1,7 +1,4 @@
-﻿groq
-python-dotenv
-jupyter
-ipykernel
-nbformat
-streamlit
-pandas
+﻿streamlit>=1.35.0
+groq>=0.11.0
+python-dotenv>=1.0.0
+pandas>=2.0.0
