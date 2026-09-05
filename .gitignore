@@ -1,40 +1,38 @@
 # Environment & Secrets
 .env
+.env.*
+!.env.example
+.streamlit/secrets.toml
 
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.pyw
-*.pyz
-*.egg
-*.egg-info/
-dist/
+*.py[cod]
+*$py.class
+*.so
 build/
-.eggs/
+dist/
+*.egg-info/
 
-# Virtual Environment
+# Virtual Environments
 venv/
 .venv/
 env/
 .env/
 
-# Jupyter
+# Jupyter & Notebooks
 .ipynb_checkpoints/
 *.ipynb_checkpoints
 
-# IDE / Editor
+# IDEs & Operating Systems
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-
-# OS
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# Project data
+# Project Persistent Data
 flashcard_db.json
+flashcard_db.json.tmp

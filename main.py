@@ -18,8 +18,7 @@ import sys
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
-# Environment bootstrap — MUST happen before importing the agent so that
-# os.environ is populated before Groq client construction.
+# Environment bootstrap
 # ---------------------------------------------------------------------------
 load_dotenv()
 
@@ -34,7 +33,7 @@ if not GROQ_API_KEY:
     sys.exit(1)
 
 # Local imports after env is loaded
-from core.agent import GroqAgent  # noqa: E402
+from core.agent import GroqAgent
 
 # ---------------------------------------------------------------------------
 # Banner
@@ -55,12 +54,15 @@ BANNER = r"""
 
 
 def main() -> None:
-    """Run the interactive flashcard CLI."""
+    """Run the interactive flashcard CLI with active model tracking."""
     print(BANNER)
-    print(f"🤖  Model  : {GROQ_MODEL}")
-    print(f"🧠  Memory : sliding window (last 6 turns)\n")
 
+    # Initialize agent cleanly
     agent = GroqAgent(api_key=GROQ_API_KEY, model=GROQ_MODEL)
+
+    last_model = agent.get_active_model()
+    print(f"🤖  Active Model : {last_model}")
+    print(f"🧠  Memory       : Sliding window (last 6 turns)\n")
 
     while True:
         try:
@@ -72,12 +74,18 @@ def main() -> None:
         if not user_input:
             continue
 
-        if user_input.lower() in {"quit", "exit", "q", "end", "stop"}:
+        if user_input.lower() in {"quit", "exit", "q", "end", "stop", "bye"}:
             print("\n👋  Session ended. Goodbye!")
             break
 
         response = agent.chat(user_input)
         print(f"\nAgent: {response}\n")
+
+        # Dynamically reflect active model changes if fallback occurred
+        current_model = agent.get_active_model()
+        if current_model != last_model:
+            print(f"[ℹ️ Fallback notice: Active model switched to '{current_model}']\n")
+            last_model = current_model
 
 
 if __name__ == "__main__":

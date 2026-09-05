@@ -1,18 +1,9 @@
 """
 app.py  --  FlashCard Quest: Gamified Streamlit Interface
 ==========================================================
-New in this revision
---------------------
-* Free-Trial Gatekeeper: guests get FREE_TRIAL_LIMIT (5) free interactions on
-  the host Groq key.  After that a soft gate disables the chat input and shows
-  a friendly BYOK (Bring-Your-Own-Key) prompt.
-* BYOK dynamic switching: users can paste their own Groq API key in the sidebar
-  at any time.  The agent is reinitialised instantly with the new key, bypassing
-  the trial limit entirely (unlimited usage).
-* Active-Model badge: the sidebar always shows which model in the fallback
-  cascade handled the latest turn via agent.get_active_model().
-* Model Fallback Cascade: GroqAgent now tries models in priority order on any
-  RateLimitError / APIStatusError / APIError (implemented in core/agent.py).
+Production-ready web interface for Flashcard Quiz Agent.
+Supports Bring-Your-Own-Key (BYOK), Free-Tier Gatekeeping,
+and runs seamlessly locally or deployed on Streamlit Cloud.
 
 Run:
     streamlit run app.py
@@ -35,7 +26,7 @@ import streamlit as st
 # ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="FlashCard Quest",
-    page_icon="\U0001f0cf",
+    page_icon="🃏",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -43,26 +34,33 @@ st.set_page_config(
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-FREE_TRIAL_LIMIT: int = 5   # interactions allowed on the host key
+FREE_TRIAL_LIMIT: int = 5  # Free turns allowed on the host key
 
 # ---------------------------------------------------------------------------
-# API / env  --  resolve host key from .env or st.secrets
+# Safe API / Host Key Resolution (avoids StreamlitSecretNotFoundError)
 # ---------------------------------------------------------------------------
-HOST_GROQ_KEY: str | None = os.getenv("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", None)
-GROQ_MODEL:    str         = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+HOST_GROQ_KEY: str | None = None
+
+# Safely query st.secrets without crashing if secrets.toml is missing
+try:
+    if "GROQ_API_KEY" in st.secrets:
+        val = str(st.secrets["GROQ_API_KEY"]).strip()
+        if val:
+            HOST_GROQ_KEY = val
+except Exception:
+    pass
 
 if not HOST_GROQ_KEY:
-    st.error(
-        "**GROQ_API_KEY is not configured on the server.**\n\n"
-        "Add it to `.env` (local) or `secrets.toml` (Streamlit Cloud) and restart.",
-        icon="\U0001f511",
-    )
-    st.stop()
+    env_val = os.getenv("GROQ_API_KEY", "").strip()
+    if env_val:
+        HOST_GROQ_KEY = env_val
+
+GROQ_MODEL: str = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 # ---------------------------------------------------------------------------
 # Local imports (after env loaded)
 # ---------------------------------------------------------------------------
-from core.agent import GroqAgent
+from core.agent import GroqAgent, DEFAULT_FALLBACK_MODELS
 from tools.flashcards import (
     FLASHCARD_DB,
     _MASTERED_STREAK,
@@ -72,7 +70,7 @@ from tools.flashcards import (
 import pandas as pd
 
 # ---------------------------------------------------------------------------
-# CSS  --  Game Theme
+# CSS  --  Cyberpunk / Duolingo Gamified Theme
 # ---------------------------------------------------------------------------
 st.markdown("""
 <style>
@@ -222,6 +220,12 @@ st.markdown("""
     font-size: 0.76rem; font-weight: 700; padding: 4px 12px;
     border-radius: 999px;
 }
+.key-badge-none {
+    display: inline-block; background: rgba(239,68,68,0.12);
+    border: 1px solid rgba(239,68,68,0.4); color: #ef4444;
+    font-size: 0.76rem; font-weight: 700; padding: 4px 12px;
+    border-radius: 999px;
+}
 .model-badge {
     display: inline-block; background: rgba(59,130,246,0.12);
     border: 1px solid rgba(59,130,246,0.4); color: #60a5fa;
@@ -293,35 +297,35 @@ STOP_WORDS = {
 }
 
 XP_LEVELS = [
-    (0,   "\U0001f331", "Seedling",   50),
-    (50,  "\U0001f4d6", "Scholar",   150),
-    (150, "\U0001f393", "Graduate",  300),
-    (300, "\u2b50",     "Expert",    500),
-    (500, "\U0001f52e", "Wizard",    750),
-    (750, "\U0001f3c6", "Legend",   9999),
+    (0,   "🌱", "Seedling",   50),
+    (50,  "📖", "Scholar",   150),
+    (150, "🎓", "Graduate",  300),
+    (300, "⭐", "Expert",    500),
+    (500, "🔮", "Wizard",    750),
+    (750, "🏆", "Legend",   9999),
 ]
 
 ACHIEVEMENT_DEFS = [
-    ("first_blood",  "\U0001f3af", "First Blood",    "Got your first correct answer!"),
-    ("streak_3",     "\U0001f525", "On Fire!",        "3 answers correct in a row!"),
-    ("streak_5",     "\u26a1",     "Lightning!",      "5 answers correct in a row!"),
-    ("streak_10",    "\U0001f32a", "Unstoppable!",    "10 answers correct in a row!"),
-    ("ten_done",     "\U0001f4da", "Bookworm",        "Answered 10 questions this session!"),
-    ("twenty_done",  "\U0001f9e0", "Brainiac",        "Answered 20 questions this session!"),
-    ("accuracy_ace", "\U0001f48e", "Ace",             "Session accuracy above 90%!"),
-    ("comeback",     "\U0001f985", "Comeback King",   "Correct after 2 wrong answers in a row!"),
+    ("first_blood",  "🎯", "First Blood",    "Got your first correct answer!"),
+    ("streak_3",     "🔥", "On Fire!",        "3 answers correct in a row!"),
+    ("streak_5",     "⚡", "Lightning!",      "5 answers correct in a row!"),
+    ("streak_10",    "🌪️", "Unstoppable!",    "10 answers correct in a row!"),
+    ("ten_done",     "📚", "Bookworm",        "Answered 10 questions this session!"),
+    ("twenty_done",  "🧠", "Brainiac",        "Answered 20 questions this session!"),
+    ("accuracy_ace", "💎", "Ace",             "Session accuracy above 90%!"),
+    ("comeback",     "🦅", "Comeback King",   "Correct after 2 wrong answers in a row!"),
 ]
 ACH_MAP = {a[0]: a for a in ACHIEVEMENT_DEFS}
 
 EXAMPLE_PROMPTS = {
-    "\u2795 Add Cards": [
+    "➕ Add Cards": [
         "Add a card: Q: What is Docker? / A: OS-level virtualisation platform",
         "Add 5 cards on Python data structures",
         "Generate 8 cards on SQL joins",
         "Add 3 cards on basics of machine learning",
         "Add a card: Q: What is recursion? / A: A function that calls itself",
     ],
-    "\U0001f3af Quiz Me": [
+    "🎯 Quiz Me": [
         "Quiz me",
         "Quiz me on Docker",
         "Quiz me with 3 questions back to back",
@@ -329,14 +333,14 @@ EXAMPLE_PROMPTS = {
         "Focus on my weakest cards only",
         "Quiz me on machine learning",
     ],
-    "\U0001f4ca Stats & Insights": [
+    "📊 Stats & Insights": [
         "Give me a full deck summary with mastery and urgency scores",
         "Which topics am I struggling with the most?",
         "How many cards have I mastered so far?",
         "What is my single weakest card right now?",
         "Show me my accuracy across all topics",
     ],
-    "\U0001f4a1 Learn + Save": [
+    "💡 Learn + Save": [
         "What is a RAG pipeline? Then add it as a card.",
         "Explain gradient descent in 2 sentences and add it as a card",
         "What is the CAP theorem? Save it to my deck.",
@@ -345,66 +349,81 @@ EXAMPLE_PROMPTS = {
 }
 
 # ---------------------------------------------------------------------------
-# Helpers -- key resolution
+# Key Resolution & Agent Lifecycle Helpers
 # ---------------------------------------------------------------------------
 
-def _resolve_key() -> str:
-    """Return the API key that should currently be active."""
+def _resolve_key() -> str | None:
+    """Return the active API key: user custom key, or host fallback."""
     user_key = st.session_state.get("user_api_key", "").strip()
-    return user_key if user_key else HOST_GROQ_KEY
+    if user_key:
+        return user_key
+    return HOST_GROQ_KEY
 
 
 def _using_custom_key() -> bool:
-    """True when the user has supplied their own API key."""
+    """True when the user has provided their own Groq API key."""
     return bool(st.session_state.get("user_api_key", "").strip())
 
 
+def _has_any_key() -> bool:
+    """True if either a custom key or host key is available."""
+    return bool(_resolve_key())
+
+
 def _trial_exhausted() -> bool:
-    """True when the free trial is used up and no custom key is set."""
-    return (
-        not _using_custom_key()
-        and st.session_state.get("trial_turns_used", 0) >= FREE_TRIAL_LIMIT
-    )
-
-
-def _render_gate_banner(context: str = "quizzing and chatting") -> None:
-    """Renders the trial-exhausted gatekeeper banner and 30-sec BYOK helper accordion."""
-    st.markdown(f"""
-    <div class="gate-banner">
-      <div style="font-size:2.5rem">\U0001f3ab</div>
-      <h3 style="color:#f59e0b;margin:8px 0">You have used your {FREE_TRIAL_LIMIT} free trial interactions!</h3>
-      <p style="color:#94a3b8">To continue {context} with zero limits, please enter your free Groq API key in the sidebar.</p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    with st.expander("\U0001f511 How to get your free Groq API key (takes 30 seconds)", expanded=True):
-        st.markdown("""
-        **Step 1.** Go to **[https://console.groq.com/keys](https://console.groq.com/keys)** — completely free, no credit card required.
-
-        **Step 2.** Click **"Create API Key"**, give it any name, and copy the key (starts with `gsk_`).
-
-        **Step 3.** Paste the key into the **sidebar text box** at the top labelled *"Your Groq API Key"*.
-
-        You will be switched to unlimited usage immediately — no page reload needed.
-        """)
+    """True when the free trial quota is reached and no custom key is active."""
+    if _using_custom_key():
+        return False
+    if not HOST_GROQ_KEY:
+        return True  # No host key available: requires BYOK
+    return st.session_state.get("trial_turns_used", 0) >= FREE_TRIAL_LIMIT
 
 
 def _ensure_agent() -> None:
-    """
-    Create or recreate the GroqAgent whenever the active API key changes.
-    Stores the resolved key that was last used so we can detect changes.
-    """
+    """Dynamically reinitialize GroqAgent when the resolved API key changes."""
     active_key = _resolve_key()
-    last_key   = st.session_state.get("_last_agent_key", "")
-    if st.session_state.agent is None or active_key != last_key:
-        st.session_state.agent          = GroqAgent(api_key=active_key, model=GROQ_MODEL)
-        st.session_state._last_agent_key = active_key
-        # Reset conversation when the key changes so history is consistent
-        if last_key and active_key != last_key:
-            st.session_state.messages = []
+    last_key = st.session_state.get("_last_agent_key", "")
+
+    if active_key:
+        if st.session_state.agent is None or active_key != last_key:
+            st.session_state.agent = GroqAgent(api_key=active_key, model=GROQ_MODEL)
+            st.session_state._last_agent_key = active_key
+            if last_key and active_key != last_key:
+                st.session_state.messages = []
+    else:
+        st.session_state.agent = None
+        st.session_state._last_agent_key = ""
+
+
+def _render_gate_banner(context: str = "quizzing and chatting") -> None:
+    """Renders friendly trial-gate banner with 30-sec BYOK helper accordion."""
+    if not HOST_GROQ_KEY and not _using_custom_key():
+        title = "🔑 Please enter your Groq API key to start"
+        msg = f"To begin {context} with zero limits, paste your free Groq API key in the sidebar."
+    else:
+        title = f"🎉 You've enjoyed your {FREE_TRIAL_LIMIT} free trial interactions!"
+        msg = f"To continue {context} with zero limits, please enter your free Groq API key in the sidebar."
+
+    st.markdown(f"""
+    <div class="gate-banner">
+      <div style="font-size:2.5rem">🎟️</div>
+      <h3 style="color:#f59e0b;margin:8px 0">{title}</h3>
+      <p style="color:#94a3b8">{msg}</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    with st.expander("🔑 How to get your free Groq API key (takes 30 seconds)", expanded=True):
+        st.markdown("""
+        1. Visit **[console.groq.com/keys](https://console.groq.com/keys)** — completely free, no credit card required.
+        2. Click **'Create API Key'**, give it any label, and copy it (`gsk_...`).
+        3. Paste it into the **sidebar input** at the top labelled *"Your Groq API Key"*.
+
+        Usage switches to unlimited immediately — no page reload required!
+        """)
+
 
 # ---------------------------------------------------------------------------
-# Session state initialisation
+# Session State Initialization
 # ---------------------------------------------------------------------------
 _DEFAULTS: dict[str, Any] = {
     "agent": None,
@@ -414,7 +433,7 @@ _DEFAULTS: dict[str, Any] = {
     # BYOK / trial
     "user_api_key": "",
     "trial_turns_used": 0,
-    # game
+    # game state machine
     "game_phase": "home",
     "current_card": None,
     "priority_reason": "",
@@ -430,7 +449,7 @@ _DEFAULTS: dict[str, Any] = {
     "session_total": 0,
     "session_achievements": [],
     "last_wrong_count": 0,
-    # settings
+    # game settings
     "quiz_topic": "",
     "quiz_mode": "adaptive",
     "total_xp": 0,
@@ -440,10 +459,11 @@ for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
-_ensure_agent()   # create agent with the currently-active key
+# Create agent if a key is currently resolvable
+_ensure_agent()
 
 # ---------------------------------------------------------------------------
-# Misc helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _fuzzy_match(user_ans: str, correct_ans: str) -> bool:
@@ -466,7 +486,7 @@ def _get_level(xp: int):
         if xp < next_xp:
             pct = (xp - min_xp) / max(next_xp - min_xp, 1)
             return icon, name, round(pct, 3), next_xp - xp
-    return "\U0001f3c6", "Legend", 1.0, 0
+    return "🏆", "Legend", 1.0, 0
 
 
 def _calc_xp(streak: int, card: dict) -> int:
@@ -479,9 +499,9 @@ def _calc_xp(streak: int, card: dict) -> int:
 def _kpi() -> dict:
     cards = list(FLASHCARD_DB.get("cards", {}).values())
     total = len(cards)
-    unattempted = sum(1 for c in cards if c["total_attempts"] == 0)
+    unattempted = sum(1 for c in cards if c.get("total_attempts", 0) == 0)
     mastered = sum(1 for c in cards if c.get("consecutive_correct", 0) >= _MASTERED_STREAK)
-    weak = sum(1 for c in cards if c["incorrect_count"] > 0
+    weak = sum(1 for c in cards if c.get("incorrect_count", 0) > 0
                and c.get("consecutive_correct", 0) < _MASTERED_STREAK)
     return {"total": total, "unattempted": unattempted, "mastered": mastered,
             "weak": weak, "cards": cards}
@@ -511,7 +531,7 @@ def _check_achievements():
     for aid in candidates:
         _, icon, name, desc = ACH_MAP[aid]
         s.session_achievements.append((aid, icon, name, desc))
-        st.toast(f"{icon} **{name}** unlocked! {desc}", icon="\U0001f3c5")
+        st.toast(f"{icon} **{name}** unlocked! {desc}", icon="🏅")
 
 
 def _render_tool_events(tool_events: list[dict]) -> None:
@@ -523,19 +543,17 @@ def _render_tool_events(tool_events: list[dict]) -> None:
             res = json.loads(raw)
         except Exception:
             res = raw
-        with st.expander(f"\u2699\ufe0f Tool: `{tn}`", expanded=False):
+        with st.expander(f"⚙️ Tool: `{tn}`", expanded=False):
             ca, cb = st.columns(2)
             ca.markdown("**Arguments**"); ca.json(args)
             cb.markdown("**Result**");    cb.json(res)
 
 
 # ---------------------------------------------------------------------------
-# SIDEBAR
+# SIDEBAR  --  Always Rendered (Never Deadlocked by missing host key)
 # ---------------------------------------------------------------------------
 with st.sidebar:
-
-    # ── BYOK section ─────────────────────────────────────────────────────────
-    st.markdown("#### \U0001f511 API Key")
+    st.markdown("#### 🔑 API Key (BYOK)")
 
     new_key_input = st.text_input(
         "Your Groq API Key (optional)",
@@ -546,23 +564,23 @@ with st.sidebar:
         label_visibility="collapsed",
     )
 
-    # Detect key changes and re-init agent
+    # Dynamic Agent Reinitialization on key change
     if new_key_input != st.session_state.user_api_key:
         st.session_state.user_api_key = new_key_input
         _ensure_agent()
         st.rerun()
 
+    # Visual status badge
     if _using_custom_key():
         st.markdown(
-            '<span class="key-badge-custom">\U0001f511 Custom Key (Unlimited)</span>',
+            '<span class="key-badge-custom">🔑 Custom Key Active (Unlimited)</span>',
             unsafe_allow_html=True,
         )
-    else:
-        used  = st.session_state.trial_turns_used
+    elif HOST_GROQ_KEY:
+        used = st.session_state.trial_turns_used
         remaining = max(FREE_TRIAL_LIMIT - used, 0)
         st.markdown(
-            f'<span class="key-badge-trial">\U0001f3ab Free Trial: {used}/{FREE_TRIAL_LIMIT} used  '
-            f'({remaining} left)</span>',
+            f'<span class="key-badge-trial">🎟️ Free Trial: {used}/{FREE_TRIAL_LIMIT} used ({remaining} left)</span>',
             unsafe_allow_html=True,
         )
         pct_trial = min(used / FREE_TRIAL_LIMIT, 1.0)
@@ -570,17 +588,22 @@ with st.sidebar:
             f'<div class="trial-wrap"><div class="trial-fill" style="width:{int(pct_trial*100)}%;"></div></div>',
             unsafe_allow_html=True,
         )
+    else:
+        st.markdown(
+            '<span class="key-badge-none">⚠️ No API Key (Enter above)</span>',
+            unsafe_allow_html=True,
+        )
 
-    # ── Active model badge ────────────────────────────────────────────────────
+    # Active model badge
     active_model = st.session_state.agent.get_active_model() if st.session_state.agent else GROQ_MODEL
     st.markdown(
-        f'<div style="margin-top:6px"><span class="model-badge">\U0001f916 {active_model}</span></div>',
+        f'<div style="margin-top:6px"><span class="model-badge">🤖 {active_model}</span></div>',
         unsafe_allow_html=True,
     )
 
     st.divider()
 
-    # ── Level + XP bar ────────────────────────────────────────────────────────
+    # Level + XP progress
     total_xp = st.session_state.total_xp
     icon, lvl_name, pct, xp_to_next = _get_level(total_xp)
 
@@ -594,35 +617,35 @@ with st.sidebar:
     """, unsafe_allow_html=True)
 
     st.divider()
-    st.markdown("#### \U0001f3ae Session Stats")
+    st.markdown("#### 🎮 Session Stats")
 
     streak = st.session_state.session_streak
     if streak >= 3:
         st.markdown(
             f'<div style="text-align:center;margin:6px 0">'
-            f'<span class="streak-pill">\U0001f525 {streak} STREAK!</span></div>',
+            f'<span class="streak-pill">🔥 {streak} STREAK!</span></div>',
             unsafe_allow_html=True)
 
     c1, c2 = st.columns(2)
-    c1.metric("\u26a1 XP",      st.session_state.session_xp)
-    c2.metric("\u2705 Correct", f"{st.session_state.session_correct}/{st.session_state.session_total}")
+    c1.metric("⚡ XP", st.session_state.session_xp)
+    c2.metric("✅ Correct", f"{st.session_state.session_correct}/{st.session_state.session_total}")
     c3, c4 = st.columns(2)
-    c3.metric("\U0001f525 Streak", streak)
-    c4.metric("\U0001f3c6 Best",   st.session_state.session_best_streak)
+    c3.metric("🔥 Streak", streak)
+    c4.metric("🏆 Best", st.session_state.session_best_streak)
 
     if st.session_state.session_total > 0:
         acc = int(100 * st.session_state.session_correct / st.session_state.session_total)
         st.progress(acc / 100, text=f"Accuracy: {acc}%")
 
     st.divider()
-    st.markdown("#### \U0001f0cf Deck Health")
+    st.markdown("#### 🃏 Deck Health")
     kpi = _kpi()
     k1, k2 = st.columns(2)
-    k1.metric("\U0001f4da Total",  kpi["total"])
-    k2.metric("\U0001f195 Unseen", kpi["unattempted"])
+    k1.metric("📚 Total", kpi["total"])
+    k2.metric("🆕 Unseen", kpi["unattempted"])
     k3, k4 = st.columns(2)
-    k3.metric("\U0001f525 Weak",   kpi["weak"])
-    k4.metric("\u2705 Mastered",  kpi["mastered"])
+    k3.metric("🔥 Weak", kpi["weak"])
+    k4.metric("✅ Mastered", kpi["mastered"])
 
     if kpi["total"] > 0:
         mp = kpi["mastered"] / kpi["total"]
@@ -630,7 +653,7 @@ with st.sidebar:
 
     if st.session_state.session_achievements:
         st.divider()
-        st.markdown("#### \U0001f3c5 Achievements")
+        st.markdown("#### 🏅 Achievements")
         html = "".join(
             f'<span class="ach-pill">{ico} {nm}</span>'
             for _, ico, nm, _ in st.session_state.session_achievements
@@ -638,7 +661,7 @@ with st.sidebar:
         st.markdown(html, unsafe_allow_html=True)
 
     st.divider()
-    with st.expander("\U0001f50d Deck Inspector", expanded=False):
+    with st.expander("🔍 Deck Inspector", expanded=False):
         cards_list = kpi["cards"]
         if not cards_list:
             st.info("No cards yet! Ask the agent to add some.")
@@ -647,22 +670,22 @@ with st.sidebar:
             for c in sorted(cards_list, key=lambda x: x["id"]):
                 consec = c.get("consecutive_correct", 0)
                 rows.append({
-                    "ID":       c["id"],
-                    "Question": c["question"][:42] + ("\u2026" if len(c["question"]) > 42 else ""),
-                    "Tries":    c["total_attempts"],
-                    "Wrong":    c["incorrect_count"],
-                    "Streak":   consec,
-                    "Done":     "\u2705" if consec >= _MASTERED_STREAK else "\u274c",
+                    "ID": c["id"],
+                    "Question": c["question"][:42] + ("…" if len(c["question"]) > 42 else ""),
+                    "Tries": c.get("total_attempts", 0),
+                    "Wrong": c.get("incorrect_count", 0),
+                    "Streak": consec,
+                    "Done": "✅" if consec >= _MASTERED_STREAK else "❌",
                 })
             df = pd.DataFrame(rows).set_index("ID")
             st.dataframe(df, use_container_width=True, height=min(38 * len(rows) + 38, 340))
 
-    if st.button("\U0001f504 Reset Session", use_container_width=True):
+    if st.button("🔄 Reset Session", use_container_width=True):
         for _rk in ["session_xp", "session_streak", "session_best_streak",
                      "session_correct", "session_total", "last_wrong_count", "wrong_streak_count"]:
             st.session_state[_rk] = 0
         st.session_state.session_achievements = []
-        st.session_state.game_phase   = "home"
+        st.session_state.game_phase = "home"
         st.session_state.current_card = None
         st.session_state.last_correct = None
         st.rerun()
@@ -671,7 +694,7 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # MAIN PANEL  -- Two tabs
 # ---------------------------------------------------------------------------
-tab_game, tab_chat = st.tabs(["\U0001f3ae  Quiz Game", "\U0001f4ac  Ask the Agent"])
+tab_game, tab_chat = st.tabs(["🎮  Quiz Game", "💬  Ask the Agent"])
 
 
 # ============================================================================
@@ -679,45 +702,44 @@ tab_game, tab_chat = st.tabs(["\U0001f3ae  Quiz Game", "\U0001f4ac  Ask the Agen
 # ============================================================================
 with tab_game:
     phase = st.session_state.game_phase
-    kpi   = _kpi()
+    kpi = _kpi()
 
     # ---- HOME ---------------------------------------------------------------
     if phase == "home":
         st.markdown("""
         <div class="hero">
-          <h1>\U0001f0cf FlashCard Quest</h1>
+          <h1>🃏 FlashCard Quest</h1>
           <p>Train your brain &bull; Master your deck &bull; Beat your streak</p>
         </div>
         """, unsafe_allow_html=True)
 
-        # ── Trial gatekeeper ──────────────────────────────────────────────────
         if _trial_exhausted():
             _render_gate_banner("playing quizzes")
             st.stop()
 
         if kpi["total"] == 0:
             st.info(
-                "\U0001f4ed **Your deck is empty!**\n\n"
-                "Switch to the **\U0001f4ac Ask the Agent** tab and type:\n"
-                "`Add 5 cards on Python data structures` \u2014 then come back to play!"
+                "📬 **Your deck is empty!**\n\n"
+                "Switch to the **💬 Ask the Agent** tab and type:\n"
+                "`Add 5 cards on Python data structures` — then come back to play!"
             )
         else:
             qs1, qs2, qs3, qs4 = st.columns(4)
-            qs1.metric("\U0001f4da Cards",  kpi["total"])
-            qs2.metric("\U0001f195 Unseen", kpi["unattempted"])
-            qs3.metric("\U0001f525 Weak",   kpi["weak"])
-            qs4.metric("\u2705 Mastered",   kpi["mastered"])
+            qs1.metric("📚 Cards", kpi["total"])
+            qs2.metric("🆕 Unseen", kpi["unattempted"])
+            qs3.metric("🔥 Weak", kpi["weak"])
+            qs4.metric("✅ Mastered", kpi["mastered"])
 
             st.markdown("---")
-            st.markdown("### \U0001f3af Choose Your Game Mode")
+            st.markdown("### 🎯 Choose Your Game Mode")
 
             mode_cols = st.columns(3)
             modes = [
-                ("adaptive",    "\U0001f3b2", "Adaptive AI",
+                ("adaptive", "🎲", "Adaptive AI",
                  "Smart priority: weak spots + unseen cards. Best for daily practice."),
-                ("unattempted", "\U0001f195", "Explorer",
+                ("unattempted", "🆕", "Explorer",
                  "Only shows cards you have NEVER seen. Perfect for new material."),
-                ("weakest",     "\U0001f525", "Weak Spot Blitz",
+                ("weakest", "🔥", "Weak Spot Blitz",
                  "Hammers your worst cards until you nail them. Intense review."),
             ]
 
@@ -725,8 +747,8 @@ with tab_game:
                 with col:
                     selected = st.session_state.quiz_mode == mode_val
                     border = "2px solid #7c3aed" if selected else "1px solid rgba(124,58,237,0.3)"
-                    bg     = "rgba(124,58,237,0.22)" if selected else "rgba(124,58,237,0.08)"
-                    chk    = " \u2713" if selected else ""
+                    bg = "rgba(124,58,237,0.22)" if selected else "rgba(124,58,237,0.08)"
+                    chk = " ✓" if selected else ""
                     st.markdown(f"""
                     <div class="mode-card" style="border:{border};background:{bg}">
                       <div class="mc-icon">{m_icon}</div>
@@ -747,103 +769,103 @@ with tab_game:
                 for w in re.findall(r"\b[a-zA-Z]{4,}\b", c["question"].lower())
                 if w not in STOP_WORDS
             })
-            topic_opts = ["\U0001f310 All Topics"] + all_words
+            topic_opts = ["🌐 All Topics"] + all_words
             chosen_topic = st.selectbox(
-                "\U0001f4cc Filter by Topic (optional)", topic_opts,
+                "📌 Filter by Topic (optional)", topic_opts,
                 help="Narrow the quiz to a keyword found in your card questions."
             )
             st.session_state.quiz_topic = (
-                "" if chosen_topic == "\U0001f310 All Topics" else chosen_topic
+                "" if chosen_topic == "🌐 All Topics" else chosen_topic
             )
 
             st.markdown("<br>", unsafe_allow_html=True)
             launch_col = st.columns([1, 2, 1])[1]
             with launch_col:
-                if st.button("\U0001f680  Start Quiz!", use_container_width=True, type="primary"):
-                    st.session_state.game_phase   = "question"
+                if st.button("🚀  Start Quiz!", use_container_width=True, type="primary"):
+                    st.session_state.game_phase = "question"
                     st.session_state.current_card = None
                     st.rerun()
 
     # ---- QUESTION -----------------------------------------------------------
     elif phase == "question":
-        # ── Trial gatekeeper ──────────────────────────────────────────────────
         if _trial_exhausted():
             _render_gate_banner("playing quizzes")
-            if st.button("\U0001f3e0 Back to Home"):
+            if st.button("🏠 Back to Home"):
                 st.session_state.game_phase = "home"
                 st.rerun()
             st.stop()
+
         if st.session_state.current_card is None:
-            raw    = _quiz_me_raw(
-                mode  = st.session_state.quiz_mode,
-                topic = st.session_state.quiz_topic or None,
-                count = 1,
+            raw = _quiz_me_raw(
+                mode=st.session_state.quiz_mode,
+                topic=st.session_state.quiz_topic or None,
+                count=1,
             )
             result = json.loads(raw)
             status = result.get("status", "")
 
             if status in ("empty", "no_match", "no_unattempted"):
-                st.warning(f"\u26a0\ufe0f {result.get('message', 'No cards available.')}")
-                if st.button("\U0001f3e0 Back to Home"):
+                st.warning(f"⚠️ {result.get('message', 'No cards available.')}")
+                if st.button("🏠 Back to Home"):
                     st.session_state.game_phase = "home"
                     st.rerun()
                 st.stop()
 
             card = result.get("card") or (result.get("cards") or [{}])[0]
-            st.session_state.current_card        = card
+            st.session_state.current_card = card
             st.session_state.correct_answer_text = card.get("answer", "")
-            st.session_state.priority_reason     = result.get("priority_reason", "")
+            st.session_state.priority_reason = result.get("priority_reason", "")
 
-        card   = st.session_state.current_card
+        card = st.session_state.current_card
         streak = st.session_state.session_streak
 
         hdr1, hdr2, hdr3 = st.columns([3, 2, 2])
         with hdr1:
             mode_label = {
-                "adaptive":    "\U0001f3b2 Adaptive",
-                "unattempted": "\U0001f195 Explorer",
-                "weakest":     "\U0001f525 Weak Spot",
+                "adaptive": "🎲 Adaptive",
+                "unattempted": "🆕 Explorer",
+                "weakest": "🔥 Weak Spot",
             }.get(st.session_state.quiz_mode, "Quiz")
-            topic_label = f" \u2014 {st.session_state.quiz_topic}" if st.session_state.quiz_topic else ""
+            topic_label = f" — {st.session_state.quiz_topic}" if st.session_state.quiz_topic else ""
             st.markdown(f"### {mode_label}{topic_label}")
         with hdr2:
             if streak >= 3:
                 st.markdown(
                     f'<div style="text-align:center;padding-top:8px">'
-                    f'<span class="streak-pill">\U0001f525 {streak} streak!</span></div>',
+                    f'<span class="streak-pill">🔥 {streak} streak!</span></div>',
                     unsafe_allow_html=True)
         with hdr3:
             st.markdown(
                 f'<div style="text-align:right;padding-top:12px;color:#c4b5fd;font-weight:700">'
-                f'\u26a1 {st.session_state.session_xp} XP</div>',
+                f'⚡ {st.session_state.session_xp} XP</div>',
                 unsafe_allow_html=True)
 
         mode_badge = {
-            "adaptive":    "Adaptive Pick",
+            "adaptive": "Adaptive Pick",
             "unattempted": "New Card!",
-            "weakest":     "Weak Spot",
+            "weakest": "Weak Spot",
         }.get(st.session_state.quiz_mode, "Question")
 
         meta_parts: list[str] = [f"Card #{card['id']}"]
         if card.get("total_attempts", 0) == 0:
-            meta_parts.append("\U0001f195 First time!")
+            meta_parts.append("🆕 First time!")
         else:
             meta_parts.append(f"Seen {card['total_attempts']}x")
         if card.get("incorrect_count", 0) > 0:
-            meta_parts.append(f"\u274c {card['incorrect_count']} mistake(s)")
+            meta_parts.append(f"❌ {card['incorrect_count']} mistake(s)")
         if card.get("consecutive_correct", 0) >= _MASTERED_STREAK:
-            meta_parts.append("\u2705 Mastered")
+            meta_parts.append("✅ Mastered")
 
         st.markdown(f"""
         <div class="q-card">
-          <div class="badge-top">\U0001f3ae {mode_badge}</div>
+          <div class="badge-top">🎮 {mode_badge}</div>
           <h2>{card["question"]}</h2>
           <div class="q-meta">{"  &bull;  ".join(meta_parts)}</div>
         </div>
         """, unsafe_allow_html=True)
 
         if st.session_state.priority_reason:
-            st.caption(f"\U0001f4a1 {st.session_state.priority_reason}")
+            st.caption(f"💡 {st.session_state.priority_reason}")
 
         with st.form("ans_form", clear_on_submit=True):
             user_ans = st.text_input(
@@ -852,12 +874,12 @@ with tab_game:
                 label_visibility="collapsed",
             )
             btn1, btn2, btn3 = st.columns([4, 2, 2])
-            submitted = btn1.form_submit_button("\u2705  Submit Answer", use_container_width=True, type="primary")
-            skipped   = btn2.form_submit_button("\u23ed\ufe0f  Skip Card",    use_container_width=True)
-            go_home   = btn3.form_submit_button("\U0001f3e0  Home",           use_container_width=True)
+            submitted = btn1.form_submit_button("✅  Submit Answer", use_container_width=True, type="primary")
+            skipped   = btn2.form_submit_button("⏭️  Skip Card",    use_container_width=True)
+            go_home   = btn3.form_submit_button("🏠  Home",           use_container_width=True)
 
         if go_home:
-            st.session_state.game_phase   = "home"
+            st.session_state.game_phase = "home"
             st.session_state.current_card = None
             st.rerun()
 
@@ -867,11 +889,11 @@ with tab_game:
                 st.rerun()
             if not _using_custom_key():
                 st.session_state.trial_turns_used += 1
-            st.session_state.last_correct     = None
-            st.session_state.session_streak   = 0
-            st.session_state.last_xp          = 0
-            st.session_state.game_phase       = "feedback"
-            st.session_state.current_card     = None
+            st.session_state.last_correct = None
+            st.session_state.session_streak = 0
+            st.session_state.last_xp = 0
+            st.session_state.game_phase = "feedback"
+            st.session_state.current_card = None
             st.rerun()
 
         if submitted:
@@ -889,42 +911,42 @@ with tab_game:
                 st.session_state.session_total += 1
 
                 if is_correct:
-                    st.session_state.session_correct     += 1
-                    st.session_state.session_streak      += 1
-                    st.session_state.session_best_streak  = max(
+                    st.session_state.session_correct += 1
+                    st.session_state.session_streak += 1
+                    st.session_state.session_best_streak = max(
                         st.session_state.session_best_streak,
                         st.session_state.session_streak,
                     )
                     xp = _calc_xp(st.session_state.session_streak, card)
-                    st.session_state.session_xp   += xp
-                    st.session_state.total_xp     += xp
-                    st.session_state.last_xp       = xp
-                    st.session_state.last_wrong_count   = prev_wrong
+                    st.session_state.session_xp += xp
+                    st.session_state.total_xp += xp
+                    st.session_state.last_xp = xp
+                    st.session_state.last_wrong_count = prev_wrong
                     st.session_state.wrong_streak_count = 0
                 else:
-                    st.session_state.session_streak     = 0
+                    st.session_state.session_streak = 0
                     st.session_state.wrong_streak_count = prev_wrong + 1
-                    st.session_state.last_xp            = 0
+                    st.session_state.last_xp = 0
 
                 st.session_state.last_correct = is_correct
-                st.session_state.game_phase   = "feedback"
+                st.session_state.game_phase = "feedback"
                 st.session_state.current_card = None
                 _check_achievements()
                 st.rerun()
 
     # ---- FEEDBACK -----------------------------------------------------------
     elif phase == "feedback":
-        is_correct  = st.session_state.last_correct
+        is_correct = st.session_state.last_correct
         answer_text = st.session_state.correct_answer_text
-        xp_gained   = st.session_state.last_xp
-        streak      = st.session_state.session_streak
+        xp_gained = st.session_state.last_xp
+        streak = st.session_state.session_streak
 
         if is_correct is None:
             st.markdown(f"""
             <div class="fb-skip">
-              <div style="font-size:3rem">\u23ed\ufe0f</div>
+              <div style="font-size:3rem">⏭️</div>
               <h2 style="color:#94a3b8;margin:8px 0">Card Skipped</h2>
-              <p style="color:#64748b">No worries \u2014 it will come back around.</p>
+              <p style="color:#64748b">No worries — it will come back around.</p>
               <p style="color:#94a3b8;margin-top:12px">The answer was:<br>
                 <strong style="color:#f8fafc;font-size:1.1rem">{answer_text}</strong></p>
             </div>
@@ -933,8 +955,8 @@ with tab_game:
         elif is_correct:
             if streak >= 5:
                 st.balloons()
-            fire        = "\U0001f525" if streak >= 3 else "\u2705"
-            streak_msg  = f"  &bull;  \U0001f525 {streak} in a row!" if streak >= 2 else ""
+            fire = "🔥" if streak >= 3 else "✅"
+            streak_msg = f"  &bull;  🔥 {streak} in a row!" if streak >= 2 else ""
             fire_prefix = "ON FIRE!&nbsp;&nbsp;" if streak >= 3 else ""
             st.markdown(f"""
             <div class="fb-correct">
@@ -948,58 +970,58 @@ with tab_game:
         else:
             st.markdown(f"""
             <div class="fb-wrong">
-              <div style="font-size:3.8rem">\u274c</div>
+              <div style="font-size:3.8rem">❌</div>
               <h2 style="color:#ef4444;margin:8px 0">Not Quite!</h2>
               <p style="color:#94a3b8">The correct answer is:</p>
               <div style="background:rgba(255,255,255,0.06);border-radius:10px;padding:12px 18px;margin:10px 0">
                 <strong style="color:#f8fafc;font-size:1.15rem">{answer_text}</strong>
               </div>
-              <p style="color:#475569;font-size:0.82rem">This card is flagged for extra review \U0001f501</p>
+              <p style="color:#475569;font-size:0.82rem">This card is flagged for extra review 🔁</p>
             </div>
             """, unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        # ── Gate check on feedback screen ────────────────────────────────────
+        # Gate check on feedback screen
         if _trial_exhausted():
             _render_gate_banner("playing more quizzes")
             b_home = st.columns([1, 2, 1])[1]
             with b_home:
-                if st.button("\U0001f3e0  Home", use_container_width=True):
-                    st.session_state.game_phase   = "home"
+                if st.button("🏠  Home", use_container_width=True):
+                    st.session_state.game_phase = "home"
                     st.session_state.current_card = None
                     st.rerun()
         else:
             b1, b2, b3 = st.columns(3)
             with b1:
-                if st.button("\u25b6\ufe0f  Next Question", use_container_width=True, type="primary"):
-                    st.session_state.game_phase   = "question"
+                if st.button("▶️  Next Question", use_container_width=True, type="primary"):
+                    st.session_state.game_phase = "question"
                     st.session_state.current_card = None
                     st.session_state.last_correct = None
                     st.rerun()
             with b2:
-                if st.button("\U0001f504  Change Mode", use_container_width=True):
-                    st.session_state.game_phase   = "home"
+                if st.button("🔄  Change Mode", use_container_width=True):
+                    st.session_state.game_phase = "home"
                     st.session_state.current_card = None
                     st.rerun()
             with b3:
-                if st.button("\U0001f3e0  Home", use_container_width=True):
-                    st.session_state.game_phase   = "home"
+                if st.button("🏠  Home", use_container_width=True):
+                    st.session_state.game_phase = "home"
                     st.session_state.current_card = None
                     st.rerun()
 
         st.markdown("---")
-        st.markdown("#### \U0001f4ca Session Scoreboard")
+        st.markdown("#### 📊 Session Scoreboard")
         sc1, sc2, sc3, sc4 = st.columns(4)
-        sc1.metric("\u26a1 XP",           st.session_state.session_xp)
-        sc2.metric("\u2705 Correct",       st.session_state.session_correct)
-        sc3.metric("\U0001f4dd Answered",  st.session_state.session_total)
+        sc1.metric("⚡ XP", st.session_state.session_xp)
+        sc2.metric("✅ Correct", st.session_state.session_correct)
+        sc3.metric("📝 Answered", st.session_state.session_total)
         acc_val = int(100 * st.session_state.session_correct / max(st.session_state.session_total, 1))
-        sc4.metric("\U0001f3af Accuracy",  f"{acc_val}%")
+        sc4.metric("🎯 Accuracy", f"{acc_val}%")
 
         if st.session_state.session_best_streak >= 2:
             st.info(
-                f"\U0001f3c6 Best streak this session: "
+                f"🏆 Best streak this session: "
                 f"**{st.session_state.session_best_streak}** correct in a row!"
             )
         if st.session_state.session_achievements:
@@ -1007,18 +1029,16 @@ with tab_game:
                 f'<span class="ach-pill">{ico} {nm}</span>'
                 for _, ico, nm, _ in st.session_state.session_achievements
             )
-            st.markdown("\U0001f3c5 **Unlocked:** " + ach_html, unsafe_allow_html=True)
+            st.markdown("🏅 **Unlocked:** " + ach_html, unsafe_allow_html=True)
 
 
 # ============================================================================
 # TAB 2 -- ASK THE AGENT
 # ============================================================================
 with tab_chat:
-    st.markdown("### \U0001f4ac Chat with Your AI Study Agent")
-    st.caption(
-        f"Model: `{st.session_state.agent.get_active_model()}`  "
-        f"\u2022  Engine: ReAct Loop  \u2022  Memory: Sliding Window (6 turns)"
-    )
+    active_m = st.session_state.agent.get_active_model() if st.session_state.agent else GROQ_MODEL
+    st.markdown("### 💬 Chat with Your AI Study Agent")
+    st.caption(f"Model: `{active_m}`  •  Engine: ReAct Loop  •  Memory: Sliding Window (6 turns)")
 
     # ── Trial gate banner ─────────────────────────────────────────────────────
     if _trial_exhausted():
@@ -1027,12 +1047,12 @@ with tab_chat:
         st.stop()
 
     # ── Example Prompt Launcher ──────────────────────────────────────────────
-    st.markdown("#### \U0001f4a1 Example Prompts \u2014 click any to send instantly")
+    st.markdown("#### 💡 Example Prompts — click any to send instantly")
     for category, prompts in EXAMPLE_PROMPTS.items():
         with st.expander(category, expanded=False):
             cols = st.columns(2)
             for i, p in enumerate(prompts):
-                label = p if len(p) <= 58 else p[:55] + "\u2026"
+                label = p if len(p) <= 58 else p[:55] + "…"
                 if cols[i % 2].button(label, key=f"ep_{hash(p)}", use_container_width=True):
                     st.session_state.pending_prompt = p
 
@@ -1051,9 +1071,13 @@ with tab_chat:
         if not user_input:
             return
 
-        # Pre-flight: re-check trial (race condition guard)
+        # Pre-flight gate check
         if _trial_exhausted():
-            st.warning("\U0001f6ab Trial limit reached. Please enter your Groq API key in the sidebar.")
+            st.warning("🚫 Trial limit reached. Please enter your Groq API key in the sidebar.")
+            return
+
+        if not st.session_state.agent:
+            st.error("Please configure an API key in the sidebar to interact with the agent.")
             return
 
         with st.chat_message("user"):
@@ -1067,7 +1091,7 @@ with tab_chat:
             collected.append(ev)
 
         with st.chat_message("assistant"):
-            with st.spinner("\U0001f914 Agent thinking\u2026"):
+            with st.spinner("🤔 Agent thinking…"):
                 reply = st.session_state.agent.chat(user_input, on_tool_event=_cb)
             if collected:
                 _render_tool_events(collected)
@@ -1079,7 +1103,7 @@ with tab_chat:
             "tool_events": collected or None,
         })
 
-        # Increment trial counter only when using the host key
+        # Increment trial turns when on host key
         if not _using_custom_key():
             st.session_state.trial_turns_used += 1
 
@@ -1090,6 +1114,6 @@ with tab_chat:
         _run_agent(p)
         st.rerun()
 
-    if user_text := st.chat_input("Ask the agent to quiz you, add cards, or show stats\u2026"):
+    if user_text := st.chat_input("Ask the agent to quiz you, add cards, or show stats…"):
         _run_agent(user_text)
         st.rerun()

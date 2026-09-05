@@ -6,10 +6,10 @@ GroqAgent -- the autonomous ReAct (Reason + Act) brain.
 Architecture decisions
 ----------------------
 * Sliding-window memory: The system prompt is always kept at index 0.
-  Only the most recent ``MEMORY_WINDOW`` conversation turns are retained so
-  that the context stays within the model effective reasoning window while
-  still giving the agent enough history to maintain coherent multi-turn
-  dialogue. Window size = 6 non-system turns (system prompt + last 6 turns).
+  Only the most recent ``MEMORY_WINDOW`` conversation turns are retained.
+  _trim_history() safely trims forward until the first non-system message
+  has role "user", preventing orphaned tool responses or broken sequences
+  that trigger HTTP 400 Bad Request errors.
 
 * Dispatch Map pattern: Tool calls are dispatched via ``TOOL_REGISTRY``
   (a plain Python dict), giving O(1) lookup with zero if/elif branching.
@@ -18,42 +18,18 @@ Architecture decisions
   appending their results back into the message history until the model
   produces a final text response with no pending tool calls.
 
+* Multi-model fallback cascade: Automatically fails over across an ordered
+  list of models on RateLimitError, APIStatusError, or APIError. Only surfaces
+  an error when all cascade models have been exhausted.
+
 * BadRequestError recovery: When the Groq API rejects a turn due to
-  malformed model-generated tool JSON (code: tool_use_failed), we strip the
-  bad assistant message from history and retry once with a plain text nudge.
+  malformed model-generated tool JSON (code: tool_use_failed), we inject
+  a corrective user prompt without destroying historical tool calls from
+  previous turns.
 
 * Empty / garbled response guard: If the model returns an empty string or
   pure whitespace as its final text, a friendly fallback is returned instead
   of surfacing a blank response to the user.
-
-Bug fixes in this revision
----------------------------
-* Autonomous Q&A generation: System prompt now explicitly instructs the model
-  to generate questions and answers from its own knowledge when the user asks
-  for cards on a general topic without providing an answer.
-* Monologue bleed guardrail: System prompt contains a CRITICAL directive
-  preventing the model from leaking internal deliberation or ellipsis loops.
-* Empty-response guard: The execution loop detects empty/whitespace assistant
-  content and returns a safe fallback instead of an invisible blank response.
-* Tool-bypass prevention: CRITICAL OPERATIONAL RULES block in the system
-  prompt forces the model to always call quiz_me before making any claim
-  about card existence, preventing context-amnesia hallucinations.
-* Multi-question gate: Agent is instructed to use quiz_me(count=N) for bulk
-  quiz requests instead of firing duplicate parallel tool calls.
-* Fuzzy answer grading: Grading section instructs the agent to accept
-  partial name matches when the core entity is unambiguously identified.
-* Text truncation / ellipsis guard: Explicit rule forbidding '...' output
-  or meta-commentary about corrupted text.
-* Batch insertion: Agent directed to use add_cards_batch for 4+ cards to
-  avoid mid-task abandonment from per-turn token-budget limits.
-
-New in this revision
---------------------
-* Multi-model fallback cascade: Models are tried in priority order from the
-  ``GROQ_FALLBACK_MODELS`` env var (comma-separated). On RateLimitError,
-  APIStatusError, or APIError the agent automatically promotes to the next
-  model and retries. Only returns an error to the caller once all models are
-  exhausted. get_active_model() exposes which model is currently answering.
 """
 
 from __future__ import annotations
@@ -70,16 +46,11 @@ from tools.registry import AVAILABLE_SCHEMAS, TOOL_REGISTRY
 # Constants
 # ---------------------------------------------------------------------------
 
-# Number of *non-system* messages to keep in the sliding window.
-# 6 gives roughly 3 full question-answer cycles of context -- enough for
-# coherent dialogue while keeping the prompt lean.
+# Number of non-system messages to retain in the sliding window.
 MEMORY_WINDOW: int = 6
 
 # Ordered model cascade for automatic failover.
 # Override by setting GROQ_FALLBACK_MODELS in .env as a comma-separated list.
-# Models are tried left-to-right; the agent advances to the next on any
-# RateLimitError / APIStatusError / APIError and only surfaces an error to
-# the caller once the entire list is exhausted.
 DEFAULT_FALLBACK_MODELS: list[str] = [
     "openai/gpt-oss-120b",   # Primary   -- highest reasoning capacity
     "qwen/qwen3.8-27b",      # Secondary -- strong function-calling fallback
@@ -183,12 +154,10 @@ You have six tools available:
 - Never hallucinate answers, card IDs, or database state.
 - Keep all replies concise and encouraging.
 
-"STRICT DOMAIN GUARDRAILS:\n"
-        "1. Off-Topic Queries: If the user asks about non-study/non-academic topics (e.g., dating advice, pop gossip, "
-        "personal opinions), politely refuse and state that you only assist with studying and flashcard quizzing.\n"
-        "2. Technical/Study Queries: If the user asks an academic or technical question (e.g., 'What is RAG pipeline?'), "
-        "provide a concise explanation (under 3 sentences), and then proactively offer: 'Would you like me to add this to your flashcard deck?'\n"
-        "3. Never execute tools on off-topic questions. Always prioritize quizzing and deck operations."
+━━━ STRICT DOMAIN GUARDRAILS ━━━
+1. Off-Topic Queries: If the user asks about non-study/non-academic topics (e.g., dating advice, pop gossip, personal opinions), politely refuse and state that you only assist with studying and flashcard quizzing.
+2. Technical/Study Queries: If the user asks an academic or technical question (e.g., 'What is RAG pipeline?'), provide a concise explanation (under 3 sentences), and then proactively offer: 'Would you like me to add this to your flashcard deck?'
+3. Never execute tools on off-topic questions. Always prioritize quizzing and deck operations.
 """
 
 
@@ -204,36 +173,31 @@ class GroqAgent:
     Parameters
     ----------
     api_key : str
-        Groq API key.  Loaded from the environment or supplied by the BYOK
-        sidebar in the Streamlit UI.
+        Groq API key. Loaded from environment or provided dynamically via BYOK.
     model : str, optional
-        Primary model identifier.  When ``GROQ_FALLBACK_MODELS`` is set in
-        the environment this parameter is ignored and the env list is used
-        as-is.  When not set, ``model`` is prepended to ``DEFAULT_FALLBACK_MODELS``
-        only if it differs from the first entry in that list, ensuring the
-        caller's explicit choice is always tried first.
+        Primary model identifier. Defaults to DEFAULT_FALLBACK_MODELS[0].
     """
 
-    def __init__(self, api_key: str, model: str) -> None:
+    def __init__(self, api_key: str, model: str = DEFAULT_FALLBACK_MODELS[0]) -> None:
         self._client = Groq(api_key=api_key)
 
-        # ── Build the fallback cascade ────────────────────────────────────
+        # ── Build the fallback cascade with deduplication ─────────────────
         env_models_raw = os.getenv("GROQ_FALLBACK_MODELS", "").strip()
         if env_models_raw:
-            # Honour the explicit environment override verbatim.
-            self._models: list[str] = [
-                m.strip() for m in env_models_raw.split(",") if m.strip()
-            ]
+            parsed = [m.strip() for m in env_models_raw.split(",") if m.strip()]
+            seen: set[str] = set()
+            self._models: list[str] = [m for m in parsed if not (m in seen or seen.add(m))]
         else:
-            # Start from the default cascade; if the caller supplied a
-            # different primary model, prepend it so it is always tried first.
-            if model and model != DEFAULT_FALLBACK_MODELS[0]:
-                self._models = [model] + DEFAULT_FALLBACK_MODELS
+            base_models = list(DEFAULT_FALLBACK_MODELS)
+            if model and model != base_models[0]:
+                self._models = [model] + [m for m in base_models if m != model]
             else:
-                self._models = list(DEFAULT_FALLBACK_MODELS)
+                self._models = base_models
 
-        # Index of the model that will be used on the next API call.
-        # Advances on transient errors; never wraps around.
+        if not self._models:
+            self._models = list(DEFAULT_FALLBACK_MODELS)
+
+        # Index of currently active model in the fallback cascade
         self._current_model_index: int = 0
 
         # Message history; index 0 is always the system prompt.
@@ -256,7 +220,7 @@ class GroqAgent:
     ) -> str:
         """
         Process a user message through the full ReAct plan-act loop and
-        return the agent final natural-language response.
+        return the agent's final natural-language response.
 
         Parameters
         ----------
@@ -264,14 +228,7 @@ class GroqAgent:
             Raw text from the user / student.
         on_tool_event : callable or None, optional
             Optional callback invoked once for every tool call executed during
-            this turn.  The callback receives a single dict with the keys:
-
-                ``tool_name``   (str)  -- name of the tool called
-                ``arguments``   (dict) -- parsed keyword arguments
-                ``result``      (str)  -- raw JSON string returned by the tool
-
-            When ``None`` (default) the loop behaves exactly as before, so
-            ``main.py`` and the terminal workflow are completely unaffected.
+            this turn. Receives dict with keys: tool_name, arguments, result.
 
         Returns
         -------
@@ -286,20 +243,35 @@ class GroqAgent:
     # ------------------------------------------------------------------
 
     def _append_user_message(self, text: str) -> None:
-        """Add a user turn and trim the sliding window."""
+        """Add a user turn and trim the sliding window safely."""
         self._history.append({"role": "user", "content": text})
         self._trim_history()
 
     def _trim_history(self) -> None:
         """
-        Enforce the sliding-window memory limit.
+        Enforce the sliding-window memory limit safely.
 
-        Keep index 0 (system prompt) untouched; retain only the last
-        ``MEMORY_WINDOW`` non-system messages.
+        Keep index 0 (system prompt) untouched. Retain the most recent
+        window of non-system messages, trimming forward until the first
+        message has role "user". This prevents orphaned tool responses or
+        broken message sequences that trigger HTTP 400 Bad Request errors.
         """
         non_system = self._history[1:]
         if len(non_system) > MEMORY_WINDOW:
-            self._history = [self._history[0]] + non_system[-MEMORY_WINDOW:]
+            candidate = non_system[-MEMORY_WINDOW:]
+
+            # Advance until the first non-system message is a user message
+            while candidate and candidate[0].get("role") != "user":
+                candidate.pop(0)
+
+            # Fallback: if no user message found in candidate, search backwards
+            if not candidate:
+                for idx in range(len(non_system) - 1, -1, -1):
+                    if non_system[idx].get("role") == "user":
+                        candidate = non_system[idx:]
+                        break
+
+            self._history = [self._history[0]] + candidate
 
     # ------------------------------------------------------------------
     # ReAct loop
@@ -318,14 +290,13 @@ class GroqAgent:
         5. Repeats until the model returns a final text response with no tool calls.
 
         Additional error handling:
-        - BadRequestError / tool_use_failed: strips bad assistant message, injects
-          a correction prompt, and retries once on the same model.
+        - BadRequestError / tool_use_failed: injects a corrective user prompt
+          without corrupting past turns, and retries once on the same model.
         - Empty / whitespace final response: returns a safe fallback string.
         """
         retried = False  # one self-correction attempt per inner loop iteration
 
         while True:
-            # ── Model cascade: try current model; failover on transient errors ──
             current_model = self._models[self._current_model_index]
 
             try:
@@ -337,7 +308,6 @@ class GroqAgent:
                 )
 
             except (RateLimitError, APIStatusError, APIError) as e:
-                # ---- Transient / quota error: promote to the next model ----
                 failed_model = current_model
                 next_index = self._current_model_index + 1
 
@@ -351,9 +321,8 @@ class GroqAgent:
                     )
                     print(warn)
                     retried = False  # allow self-correction on the new model
-                    continue  # retry the outer while-loop with the new model
+                    continue
 
-                # All models exhausted — surface a clean error
                 all_names = " → ".join(self._models)
                 error_msg = (
                     f"⚠️ All models in the fallback cascade are currently unavailable "
@@ -364,19 +333,12 @@ class GroqAgent:
                 return error_msg
 
             except BadRequestError as exc:
-                # ---- Malformed tool-argument JSON produced by the model ----
                 error_body = exc.body or {}
                 code = error_body.get("error", {}).get("code", "")
 
                 if code == "tool_use_failed" and not retried:
                     retried = True
-                    # Remove the last assistant turn that had bad JSON and
-                    # inject a corrective user nudge so the model tries again
-                    # with valid arguments.
-                    self._history = [
-                        m for m in self._history
-                        if not (m.get("role") == "assistant" and m.get("tool_calls"))
-                    ]
+                    # Inject a corrective user prompt without wiping historical messages
                     self._history.append({
                         "role": "user",
                         "content": (
@@ -385,9 +347,8 @@ class GroqAgent:
                         ),
                     })
                     print("[Warning: Malformed tool JSON detected -- retrying automatically...]")
-                    continue  # retry the loop
+                    continue
 
-                # Any other 400 -- surface a clean message rather than crash
                 fallback = (
                     "I ran into a temporary issue communicating with the AI. "
                     "Please try again."
@@ -400,10 +361,8 @@ class GroqAgent:
             tool_calls = assistant_msg.tool_calls  # None or list
 
             if not tool_calls:
-                # ---- Terminal state: the model produced a final answer ----
                 final_text = (assistant_msg.content or "").strip()
 
-                # Empty / garbled response guard
                 if not final_text:
                     final_text = (
                         "I processed your request but did not produce a text response. "
@@ -417,11 +376,7 @@ class GroqAgent:
                 self._trim_history()
                 return final_text
 
-            # ---- Intermediate state: one or more tool calls requested ----
-            # Build a clean assistant message dict. We deliberately avoid
-            # model_dump() because the Groq SDK injects extra fields such as
-            # 'annotations' that the Groq API itself rejects with a 400 error
-            # when they appear in the message history.
+            # ── Process tool calls ───────────────────────────────────────────
             clean_tool_calls = [
                 {
                     "id": tc.id,
@@ -445,7 +400,6 @@ class GroqAgent:
 
                 print(f"\n[Agent paused to use tool: {tool_name}]")
 
-                # Parse arguments safely
                 try:
                     kwargs: dict[str, Any] = json.loads(raw_args) if raw_args else {}
                 except json.JSONDecodeError as exc:
@@ -454,7 +408,6 @@ class GroqAgent:
                         "message": f"Failed to parse tool arguments: {exc}",
                     })
                 else:
-                    # O(1) dispatch -- no if/elif chains
                     executor = TOOL_REGISTRY.get(tool_name)
                     if executor is None:
                         tool_result = json.dumps({
@@ -472,7 +425,6 @@ class GroqAgent:
 
                 print(f"[Tool result]: {tool_result}\n")
 
-                # Fire the optional UI callback with structured event data
                 if callable(on_tool_event):
                     try:
                         parsed_args = json.loads(raw_args) if raw_args else {}
@@ -484,13 +436,11 @@ class GroqAgent:
                         "result": tool_result,
                     })
 
-                # Append the tool result so the model can reason over it
                 self._history.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
                     "content": tool_result,
                 })
 
-            # Loop again -- the model will now reason over the tool results
             self._trim_history()
-            retried = False  # reset retry flag for the next sub-loop iteration
+            retried = False
