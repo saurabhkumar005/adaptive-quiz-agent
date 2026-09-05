@@ -46,14 +46,23 @@ Bug fixes in this revision
   or meta-commentary about corrupted text.
 * Batch insertion: Agent directed to use add_cards_batch for 4+ cards to
   avoid mid-task abandonment from per-turn token-budget limits.
+
+New in this revision
+--------------------
+* Multi-model fallback cascade: Models are tried in priority order from the
+  ``GROQ_FALLBACK_MODELS`` env var (comma-separated). On RateLimitError,
+  APIStatusError, or APIError the agent automatically promotes to the next
+  model and retries. Only returns an error to the caller once all models are
+  exhausted. get_active_model() exposes which model is currently answering.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
-from groq import Groq, BadRequestError, APIError, RateLimitError
+from groq import Groq, BadRequestError, APIError, APIStatusError, RateLimitError
 
 from tools.registry import AVAILABLE_SCHEMAS, TOOL_REGISTRY
 
@@ -65,6 +74,18 @@ from tools.registry import AVAILABLE_SCHEMAS, TOOL_REGISTRY
 # 6 gives roughly 3 full question-answer cycles of context -- enough for
 # coherent dialogue while keeping the prompt lean.
 MEMORY_WINDOW: int = 6
+
+# Ordered model cascade for automatic failover.
+# Override by setting GROQ_FALLBACK_MODELS in .env as a comma-separated list.
+# Models are tried left-to-right; the agent advances to the next on any
+# RateLimitError / APIStatusError / APIError and only surfaces an error to
+# the caller once the entire list is exhausted.
+DEFAULT_FALLBACK_MODELS: list[str] = [
+    "openai/gpt-oss-120b",   # Primary   -- highest reasoning capacity
+    "qwen/qwen3.8-27b",      # Secondary -- strong function-calling fallback
+    "qwen/qwen3.6-27b",      # Tertiary  -- lightweight reasoning fallback
+    "openai/gpt-oss-20b",    # Final resort
+]
 
 SYSTEM_PROMPT: str = """You are an intelligent, adaptive Flashcard Quiz Agent.
 
@@ -183,14 +204,38 @@ class GroqAgent:
     Parameters
     ----------
     api_key : str
-        Groq API key loaded from the environment.
-    model : str
-        Groq model identifier (e.g. ``"openai/gpt-oss-120b"``).
+        Groq API key.  Loaded from the environment or supplied by the BYOK
+        sidebar in the Streamlit UI.
+    model : str, optional
+        Primary model identifier.  When ``GROQ_FALLBACK_MODELS`` is set in
+        the environment this parameter is ignored and the env list is used
+        as-is.  When not set, ``model`` is prepended to ``DEFAULT_FALLBACK_MODELS``
+        only if it differs from the first entry in that list, ensuring the
+        caller's explicit choice is always tried first.
     """
 
     def __init__(self, api_key: str, model: str) -> None:
         self._client = Groq(api_key=api_key)
-        self._model = model
+
+        # ── Build the fallback cascade ────────────────────────────────────
+        env_models_raw = os.getenv("GROQ_FALLBACK_MODELS", "").strip()
+        if env_models_raw:
+            # Honour the explicit environment override verbatim.
+            self._models: list[str] = [
+                m.strip() for m in env_models_raw.split(",") if m.strip()
+            ]
+        else:
+            # Start from the default cascade; if the caller supplied a
+            # different primary model, prepend it so it is always tried first.
+            if model and model != DEFAULT_FALLBACK_MODELS[0]:
+                self._models = [model] + DEFAULT_FALLBACK_MODELS
+            else:
+                self._models = list(DEFAULT_FALLBACK_MODELS)
+
+        # Index of the model that will be used on the next API call.
+        # Advances on transient errors; never wraps around.
+        self._current_model_index: int = 0
+
         # Message history; index 0 is always the system prompt.
         self._history: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT}
@@ -199,6 +244,10 @@ class GroqAgent:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def get_active_model(self) -> str:
+        """Return the model identifier that is currently active in the cascade."""
+        return self._models[self._current_model_index]
 
     def chat(
         self,
@@ -258,37 +307,62 @@ class GroqAgent:
 
     def _run_loop(self, on_tool_event: Any = None) -> str:
         """
-        Continuous plan-act execution loop.
+        Continuous plan-act execution loop with multi-model fallback cascade.
 
         Each iteration:
-        1. Sends the current message history + tool schemas to Groq.
-        2. Checks for tool calls in the response.
-        3. Dispatches each tool call via the TOOL_REGISTRY (O(1) lookup).
-        4. Appends the tool result with role "tool" and matching id.
-        5. Repeats until the model returns a final text response.
+        1. Tries the current model in the cascade (self._models[self._current_model_index]).
+        2. On RateLimitError / APIStatusError / APIError: logs a warning,
+           advances to the next model, and retries immediately.
+        3. Only surfaces a user-facing error once all cascade models are exhausted.
+        4. Dispatches tool calls via TOOL_REGISTRY (O(1) lookup).
+        5. Repeats until the model returns a final text response with no tool calls.
 
-        Error handling:
-        - ``BadRequestError`` with code ``tool_use_failed`` means the model
-          emitted malformed tool-argument JSON on this turn. We pop the bad
-          assistant message, inject a plain-text correction prompt, and retry
-          once so the agent recovers gracefully without crashing.
-        - Empty / garbled final responses: if the model returns empty or
-          whitespace-only content, a safe fallback message is returned.
+        Additional error handling:
+        - BadRequestError / tool_use_failed: strips bad assistant message, injects
+          a correction prompt, and retries once on the same model.
+        - Empty / whitespace final response: returns a safe fallback string.
         """
-        retried = False  # allow at most one self-correction per turn
+        retried = False  # one self-correction attempt per inner loop iteration
 
         while True:
+            # ── Model cascade: try current model; failover on transient errors ──
+            current_model = self._models[self._current_model_index]
+
             try:
                 response = self._client.chat.completions.create(
-                    model=self._model,
+                    model=current_model,
                     messages=self._history,
                     tools=AVAILABLE_SCHEMAS,
                     tool_choice="auto",
                 )
-            except RateLimitError as e:
-                return f"[Rate Limit Exceeded]: Daily token quota reached. Details: {e.message}"
-            except APIError as e:
-                return f"[API Error]: {e}"
+
+            except (RateLimitError, APIStatusError, APIError) as e:
+                # ---- Transient / quota error: promote to the next model ----
+                failed_model = current_model
+                next_index = self._current_model_index + 1
+
+                if next_index < len(self._models):
+                    next_model = self._models[next_index]
+                    self._current_model_index = next_index
+                    warn = (
+                        f"[⚠️ Model '{failed_model}' failed "
+                        f"({type(e).__name__}). "
+                        f"Failing over to '{next_model}'...]"
+                    )
+                    print(warn)
+                    retried = False  # allow self-correction on the new model
+                    continue  # retry the outer while-loop with the new model
+
+                # All models exhausted — surface a clean error
+                all_names = " → ".join(self._models)
+                error_msg = (
+                    f"⚠️ All models in the fallback cascade are currently unavailable "
+                    f"({all_names}). Please try again in a few minutes."
+                )
+                print(f"[All models exhausted: {type(e).__name__}: {e}]")
+                self._history.append({"role": "assistant", "content": error_msg})
+                return error_msg
+
             except BadRequestError as exc:
                 # ---- Malformed tool-argument JSON produced by the model ----
                 error_body = exc.body or {}
@@ -321,6 +395,7 @@ class GroqAgent:
                 self._history.append({"role": "assistant", "content": fallback})
                 return fallback
 
+            # ── Successful API response ──────────────────────────────────────
             assistant_msg = response.choices[0].message
             tool_calls = assistant_msg.tool_calls  # None or list
 

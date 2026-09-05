@@ -1,15 +1,18 @@
 """
 app.py  --  FlashCard Quest: Gamified Streamlit Interface
 ==========================================================
-Two-tab interface:
-  Tab 1  ->  Quiz Game  (gamified card-by-card mode with XP, streaks, levels, achievements)
-  Tab 2  ->  Ask Agent  (free-form chat with full tool-call traces)
-
-Game Flow (Tab 1):
-  home  ->  question  ->  feedback  ->  next question (loops)
-
-Direct tool calls are used in the game tab for instant feedback (no LLM latency).
-The full GroqAgent with its ReAct loop powers Tab 2.
+New in this revision
+--------------------
+* Free-Trial Gatekeeper: guests get FREE_TRIAL_LIMIT (5) free interactions on
+  the host Groq key.  After that a soft gate disables the chat input and shows
+  a friendly BYOK (Bring-Your-Own-Key) prompt.
+* BYOK dynamic switching: users can paste their own Groq API key in the sidebar
+  at any time.  The agent is reinitialised instantly with the new key, bypassing
+  the trial limit entirely (unlimited usage).
+* Active-Model badge: the sidebar always shows which model in the fallback
+  cascade handled the latest turn via agent.get_active_model().
+* Model Fallback Cascade: GroqAgent now tries models in priority order on any
+  RateLimitError / APIStatusError / APIError (implemented in core/agent.py).
 
 Run:
     streamlit run app.py
@@ -38,17 +41,26 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# API / env
+# Constants
 # ---------------------------------------------------------------------------
-GROQ_API_KEY: str | None = os.getenv("GROQ_API_KEY")
-GROQ_MODEL: str = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+FREE_TRIAL_LIMIT: int = 5   # interactions allowed on the host key
 
-if not GROQ_API_KEY:
-    st.error("**GROQ_API_KEY is not set.** Add it to `.env` and restart: `streamlit run app.py`", icon="\U0001f511")
+# ---------------------------------------------------------------------------
+# API / env  --  resolve host key from .env or st.secrets
+# ---------------------------------------------------------------------------
+HOST_GROQ_KEY: str | None = os.getenv("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", None)
+GROQ_MODEL:    str         = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+
+if not HOST_GROQ_KEY:
+    st.error(
+        "**GROQ_API_KEY is not configured on the server.**\n\n"
+        "Add it to `.env` (local) or `secrets.toml` (Streamlit Cloud) and restart.",
+        icon="\U0001f511",
+    )
     st.stop()
 
 # ---------------------------------------------------------------------------
-# Local imports (after env loaded so Groq client sees the key)
+# Local imports (after env loaded)
 # ---------------------------------------------------------------------------
 from core.agent import GroqAgent
 from tools.flashcards import (
@@ -75,7 +87,7 @@ st.markdown("""
     background: rgba(12, 10, 35, 0.97);
     border-right: 1px solid rgba(124, 58, 237, 0.25);
     min-width: 300px !important;
-    max-width: 330px !important;
+    max-width: 340px !important;
 }
 
 /* metric cards */
@@ -159,6 +171,10 @@ st.markdown("""
 .xp-wrap { background: rgba(255,255,255,0.07); border-radius: 999px; height: 9px; margin: 6px 0 2px; overflow: hidden; }
 .xp-fill  { height: 100%; border-radius: 999px; background: linear-gradient(90deg, #7c3aed, #06b6d4); transition: width 0.9s ease; }
 
+/* trial bar */
+.trial-wrap { background: rgba(255,255,255,0.07); border-radius: 999px; height: 8px; margin: 4px 0; overflow: hidden; }
+.trial-fill  { height: 100%; border-radius: 999px; background: linear-gradient(90deg, #f59e0b, #ef4444); transition: width 0.6s ease; }
+
 /* level badge */
 .lvl-badge {
     display: flex; align-items: center; justify-content: center; flex-direction: column;
@@ -191,6 +207,31 @@ st.markdown("""
     color: #fbbf24; font-size: 0.76rem; font-weight: 700;
     padding: 4px 11px; border-radius: 999px; margin: 3px 2px;
     animation: popIn 0.35s ease;
+}
+
+/* BYOK / model / trial badges */
+.key-badge-custom {
+    display: inline-block; background: rgba(16,185,129,0.15);
+    border: 1px solid rgba(16,185,129,0.5); color: #10b981;
+    font-size: 0.76rem; font-weight: 700; padding: 4px 12px;
+    border-radius: 999px;
+}
+.key-badge-trial {
+    display: inline-block; background: rgba(245,158,11,0.12);
+    border: 1px solid rgba(245,158,11,0.4); color: #f59e0b;
+    font-size: 0.76rem; font-weight: 700; padding: 4px 12px;
+    border-radius: 999px;
+}
+.model-badge {
+    display: inline-block; background: rgba(59,130,246,0.12);
+    border: 1px solid rgba(59,130,246,0.4); color: #60a5fa;
+    font-size: 0.72rem; font-weight: 700; padding: 4px 12px;
+    border-radius: 999px; font-family: monospace;
+}
+.gate-banner {
+    background: linear-gradient(135deg, rgba(245,158,11,0.12), rgba(239,68,68,0.08));
+    border: 2px solid rgba(245,158,11,0.5);
+    border-radius: 16px; padding: 24px 28px; text-align: center; margin: 16px 0;
 }
 
 /* hero */
@@ -304,12 +345,54 @@ EXAMPLE_PROMPTS = {
 }
 
 # ---------------------------------------------------------------------------
+# Helpers -- key resolution
+# ---------------------------------------------------------------------------
+
+def _resolve_key() -> str:
+    """Return the API key that should currently be active."""
+    user_key = st.session_state.get("user_api_key", "").strip()
+    return user_key if user_key else HOST_GROQ_KEY
+
+
+def _using_custom_key() -> bool:
+    """True when the user has supplied their own API key."""
+    return bool(st.session_state.get("user_api_key", "").strip())
+
+
+def _trial_exhausted() -> bool:
+    """True when the free trial is used up and no custom key is set."""
+    return (
+        not _using_custom_key()
+        and st.session_state.get("trial_turns_used", 0) >= FREE_TRIAL_LIMIT
+    )
+
+
+def _ensure_agent() -> None:
+    """
+    Create or recreate the GroqAgent whenever the active API key changes.
+    Stores the resolved key that was last used so we can detect changes.
+    """
+    active_key = _resolve_key()
+    last_key   = st.session_state.get("_last_agent_key", "")
+    if st.session_state.agent is None or active_key != last_key:
+        st.session_state.agent          = GroqAgent(api_key=active_key, model=GROQ_MODEL)
+        st.session_state._last_agent_key = active_key
+        # Reset conversation when the key changes so history is consistent
+        if last_key and active_key != last_key:
+            st.session_state.messages = []
+
+# ---------------------------------------------------------------------------
 # Session state initialisation
 # ---------------------------------------------------------------------------
 _DEFAULTS: dict[str, Any] = {
     "agent": None,
+    "_last_agent_key": "",
     "messages": [],
     "pending_prompt": None,
+    # BYOK / trial
+    "user_api_key": "",
+    "trial_turns_used": 0,
+    # game
     "game_phase": "home",
     "current_card": None,
     "priority_reason": "",
@@ -317,6 +400,7 @@ _DEFAULTS: dict[str, Any] = {
     "last_xp": 0,
     "correct_answer_text": "",
     "wrong_streak_count": 0,
+    # session stats
     "session_xp": 0,
     "session_streak": 0,
     "session_best_streak": 0,
@@ -324,6 +408,7 @@ _DEFAULTS: dict[str, Any] = {
     "session_total": 0,
     "session_achievements": [],
     "last_wrong_count": 0,
+    # settings
     "quiz_topic": "",
     "quiz_mode": "adaptive",
     "total_xp": 0,
@@ -333,11 +418,10 @@ for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
-if st.session_state.agent is None:
-    st.session_state.agent = GroqAgent(api_key=GROQ_API_KEY, model=GROQ_MODEL)
+_ensure_agent()   # create agent with the currently-active key
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Misc helpers
 # ---------------------------------------------------------------------------
 
 def _fuzzy_match(user_ans: str, correct_ans: str) -> bool:
@@ -410,9 +494,9 @@ def _check_achievements():
 
 def _render_tool_events(tool_events: list[dict]) -> None:
     for event in tool_events:
-        tn = event.get("tool_name", "?")
+        tn  = event.get("tool_name", "?")
         args = event.get("arguments", {})
-        raw = event.get("result", "")
+        raw  = event.get("result", "")
         try:
             res = json.loads(raw)
         except Exception:
@@ -427,6 +511,54 @@ def _render_tool_events(tool_events: list[dict]) -> None:
 # SIDEBAR
 # ---------------------------------------------------------------------------
 with st.sidebar:
+
+    # ── BYOK section ─────────────────────────────────────────────────────────
+    st.markdown("#### \U0001f511 API Key")
+
+    new_key_input = st.text_input(
+        "Your Groq API Key (optional)",
+        value=st.session_state.user_api_key,
+        type="password",
+        placeholder="gsk_...",
+        help="Paste your free Groq API key here for unlimited usage. Get one at console.groq.com/keys",
+        label_visibility="collapsed",
+    )
+
+    # Detect key changes and re-init agent
+    if new_key_input != st.session_state.user_api_key:
+        st.session_state.user_api_key = new_key_input
+        _ensure_agent()
+        st.rerun()
+
+    if _using_custom_key():
+        st.markdown(
+            '<span class="key-badge-custom">\U0001f511 Custom Key (Unlimited)</span>',
+            unsafe_allow_html=True,
+        )
+    else:
+        used  = st.session_state.trial_turns_used
+        remaining = max(FREE_TRIAL_LIMIT - used, 0)
+        st.markdown(
+            f'<span class="key-badge-trial">\U0001f3ab Free Trial: {used}/{FREE_TRIAL_LIMIT} used  '
+            f'({remaining} left)</span>',
+            unsafe_allow_html=True,
+        )
+        pct_trial = min(used / FREE_TRIAL_LIMIT, 1.0)
+        st.markdown(
+            f'<div class="trial-wrap"><div class="trial-fill" style="width:{int(pct_trial*100)}%;"></div></div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── Active model badge ────────────────────────────────────────────────────
+    active_model = st.session_state.agent.get_active_model() if st.session_state.agent else GROQ_MODEL
+    st.markdown(
+        f'<div style="margin-top:6px"><span class="model-badge">\U0001f916 {active_model}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    st.divider()
+
+    # ── Level + XP bar ────────────────────────────────────────────────────────
     total_xp = st.session_state.total_xp
     icon, lvl_name, pct, xp_to_next = _get_level(total_xp)
 
@@ -467,8 +599,8 @@ with st.sidebar:
     k1.metric("\U0001f4da Total",  kpi["total"])
     k2.metric("\U0001f195 Unseen", kpi["unattempted"])
     k3, k4 = st.columns(2)
-    k3.metric("\U0001f525 Weak",    kpi["weak"])
-    k4.metric("\u2705 Mastered",   kpi["mastered"])
+    k3.metric("\U0001f525 Weak",   kpi["weak"])
+    k4.metric("\u2705 Mastered",  kpi["mastered"])
 
     if kpi["total"] > 0:
         mp = kpi["mastered"] / kpi["total"]
@@ -478,8 +610,8 @@ with st.sidebar:
         st.divider()
         st.markdown("#### \U0001f3c5 Achievements")
         html = "".join(
-            f'<span class="ach-pill">{icon} {name}</span>'
-            for _, icon, name, _ in st.session_state.session_achievements
+            f'<span class="ach-pill">{ico} {nm}</span>'
+            for _, ico, nm, _ in st.session_state.session_achievements
         )
         st.markdown(html, unsafe_allow_html=True)
 
@@ -508,10 +640,11 @@ with st.sidebar:
                      "session_correct", "session_total", "last_wrong_count", "wrong_streak_count"]:
             st.session_state[_rk] = 0
         st.session_state.session_achievements = []
-        st.session_state.game_phase = "home"
+        st.session_state.game_phase   = "home"
         st.session_state.current_card = None
         st.session_state.last_correct = None
         st.rerun()
+
 
 # ---------------------------------------------------------------------------
 # MAIN PANEL  -- Two tabs
@@ -526,7 +659,7 @@ with tab_game:
     phase = st.session_state.game_phase
     kpi   = _kpi()
 
-    # --- HOME ---
+    # ---- HOME ---------------------------------------------------------------
     if phase == "home":
         st.markdown("""
         <div class="hero">
@@ -538,15 +671,15 @@ with tab_game:
         if kpi["total"] == 0:
             st.info(
                 "\U0001f4ed **Your deck is empty!**\n\n"
-                "Switch to the **\U0001f4ac Ask the Agent** tab and type something like:\n"
+                "Switch to the **\U0001f4ac Ask the Agent** tab and type:\n"
                 "`Add 5 cards on Python data structures` \u2014 then come back to play!"
             )
         else:
             qs1, qs2, qs3, qs4 = st.columns(4)
-            qs1.metric("\U0001f4da Cards",   kpi["total"])
-            qs2.metric("\U0001f195 Unseen",  kpi["unattempted"])
-            qs3.metric("\U0001f525 Weak",    kpi["weak"])
-            qs4.metric("\u2705 Mastered",    kpi["mastered"])
+            qs1.metric("\U0001f4da Cards",  kpi["total"])
+            qs2.metric("\U0001f195 Unseen", kpi["unattempted"])
+            qs3.metric("\U0001f525 Weak",   kpi["weak"])
+            qs4.metric("\u2705 Mastered",   kpi["mastered"])
 
             st.markdown("---")
             st.markdown("### \U0001f3af Choose Your Game Mode")
@@ -604,7 +737,7 @@ with tab_game:
                     st.session_state.current_card = None
                     st.rerun()
 
-    # --- QUESTION ---
+    # ---- QUESTION -----------------------------------------------------------
     elif phase == "question":
         if st.session_state.current_card is None:
             raw    = _quiz_me_raw(
@@ -706,9 +839,9 @@ with tab_game:
             if not user_ans.strip():
                 st.warning("Please type your answer before submitting!")
             else:
-                is_correct   = _fuzzy_match(user_ans.strip(), card["answer"])
+                is_correct = _fuzzy_match(user_ans.strip(), card["answer"])
                 _record_answer_raw(card["id"], is_correct)
-                prev_wrong   = st.session_state.wrong_streak_count
+                prev_wrong = st.session_state.wrong_streak_count
                 st.session_state.session_total += 1
 
                 if is_correct:
@@ -735,7 +868,7 @@ with tab_game:
                 _check_achievements()
                 st.rerun()
 
-    # --- FEEDBACK ---
+    # ---- FEEDBACK -----------------------------------------------------------
     elif phase == "feedback":
         is_correct  = st.session_state.last_correct
         answer_text = st.session_state.correct_answer_text
@@ -756,8 +889,8 @@ with tab_game:
         elif is_correct:
             if streak >= 5:
                 st.balloons()
-            fire       = "\U0001f525" if streak >= 3 else "\u2705"
-            streak_msg = f"  &bull;  \U0001f525 {streak} in a row!" if streak >= 2 else ""
+            fire        = "\U0001f525" if streak >= 3 else "\u2705"
+            streak_msg  = f"  &bull;  \U0001f525 {streak} in a row!" if streak >= 2 else ""
             fire_prefix = "ON FIRE!&nbsp;&nbsp;" if streak >= 3 else ""
             st.markdown(f"""
             <div class="fb-correct">
@@ -804,11 +937,11 @@ with tab_game:
         st.markdown("---")
         st.markdown("#### \U0001f4ca Session Scoreboard")
         sc1, sc2, sc3, sc4 = st.columns(4)
-        sc1.metric("\u26a1 XP",       st.session_state.session_xp)
-        sc2.metric("\u2705 Correct",  st.session_state.session_correct)
-        sc3.metric("\U0001f4dd Answered", st.session_state.session_total)
+        sc1.metric("\u26a1 XP",           st.session_state.session_xp)
+        sc2.metric("\u2705 Correct",       st.session_state.session_correct)
+        sc3.metric("\U0001f4dd Answered",  st.session_state.session_total)
         acc_val = int(100 * st.session_state.session_correct / max(st.session_state.session_total, 1))
-        sc4.metric("\U0001f3af Accuracy", f"{acc_val}%")
+        sc4.metric("\U0001f3af Accuracy",  f"{acc_val}%")
 
         if st.session_state.session_best_streak >= 2:
             st.info(
@@ -829,10 +962,40 @@ with tab_game:
 with tab_chat:
     st.markdown("### \U0001f4ac Chat with Your AI Study Agent")
     st.caption(
-        f"Model: `{GROQ_MODEL}`  \u2022  Engine: ReAct Loop  \u2022  "
-        "Memory: Sliding Window (6 turns)"
+        f"Model: `{st.session_state.agent.get_active_model()}`  "
+        f"\u2022  Engine: ReAct Loop  \u2022  Memory: Sliding Window (6 turns)"
     )
 
+    # ── Trial gate banner ─────────────────────────────────────────────────────
+    if _trial_exhausted():
+        st.markdown("""
+        <div class="gate-banner">
+          <div style="font-size:2.5rem">\U0001f3ab</div>
+          <h3 style="color:#f59e0b;margin:8px 0">You have used your 5 free trial interactions!</h3>
+          <p style="color:#94a3b8">To continue quizzing with zero limits, enter your free Groq API key in the sidebar.</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        with st.expander("\U0001f511 How to get your free Groq API key (30 seconds)", expanded=True):
+            st.markdown("""
+            **Step 1.** Go to **https://console.groq.com/keys** — completely free, no credit card.
+
+            **Step 2.** Click **"Create API Key"**, give it any name, and copy the key (starts with `gsk_`).
+
+            **Step 3.** Paste the key into the **sidebar text box** at the top labelled *"Your Groq API Key"*.
+
+            You will be switched to unlimited usage immediately \u2014 no page reload needed.
+            """)
+
+        st.info(
+            "\U0001f4a1 While you set up your key, you can still use the **\U0001f3ae Quiz Game** tab freely "
+            "(the game tab uses direct tool calls and doesn't count against the trial).",
+            icon="\u2139\ufe0f",
+        )
+        # Hard-stop the chat section — no input rendered
+        st.stop()
+
+    # ── Example Prompt Launcher ──────────────────────────────────────────────
     st.markdown("#### \U0001f4a1 Example Prompts \u2014 click any to send instantly")
     for category, prompts in EXAMPLE_PROMPTS.items():
         with st.expander(category, expanded=False):
@@ -844,16 +1007,24 @@ with tab_chat:
 
     st.divider()
 
+    # ── Chat history ──────────────────────────────────────────────────────────
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             if msg["role"] == "assistant" and msg.get("tool_events"):
                 _render_tool_events(msg["tool_events"])
             st.markdown(msg["content"])
 
+    # ── Agent runner ──────────────────────────────────────────────────────────
     def _run_agent(user_input: str) -> None:
         user_input = user_input.strip()
         if not user_input:
             return
+
+        # Pre-flight: re-check trial (race condition guard)
+        if _trial_exhausted():
+            st.warning("\U0001f6ab Trial limit reached. Please enter your Groq API key in the sidebar.")
+            return
+
         with st.chat_message("user"):
             st.markdown(user_input)
         st.session_state.messages.append(
@@ -877,6 +1048,11 @@ with tab_chat:
             "tool_events": collected or None,
         })
 
+        # Increment trial counter only when using the host key
+        if not _using_custom_key():
+            st.session_state.trial_turns_used += 1
+
+    # ── Consume pending quick prompt ──────────────────────────────────────────
     if st.session_state.pending_prompt:
         p = st.session_state.pending_prompt
         st.session_state.pending_prompt = None
